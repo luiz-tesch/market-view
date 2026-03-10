@@ -1,91 +1,134 @@
 # 🤖 Polymarket Bot
 
-Bot de análise e trading no [Polymarket](https://polymarket.com) usando Claude (Anthropic) como motor de análise.
+Bot de análise e trading automático no [Polymarket](https://polymarket.com), usando **Groq + LLaMA 3.3 70B** (gratuito) como motor de análise e **NewsAPI** (opcional, gratuito) para contexto de notícias.
+
+---
 
 ## Como funciona
 
 ```
-Polymarket API → lista mercados
-       ↓
-NewsAPI → busca notícias relevantes
-       ↓
-Claude → estima probabilidade real
-       ↓
-Risk Manager → calcula tamanho da aposta (Kelly Criterion)
-       ↓
-Execução → coloca ordem (ou simula em DRY_RUN)
+Polymarket Gamma API
+        ↓
+   Lista mercados ativos
+        ↓
+   NewsAPI (opcional)
+   Busca notícias recentes
+        ↓
+   Groq / LLaMA 3.3 70B
+   Estima probabilidade real
+        ↓
+   Risk Manager
+   Kelly Criterion + limites diários
+        ↓
+   Execução (ou simulação em DRY_RUN)
 ```
+
+O bot compara a **probabilidade estimada pelo LLaMA** com o **preço atual do mercado**. Se a diferença (edge) for maior que o mínimo configurado, ele recomenda BUY ou SELL.
+
+---
 
 ## Setup
 
-### 1. Clone e instale dependências
+### 1. Clone e crie o ambiente virtual
 ```bash
 git clone <seu-repo>
 cd polymarket-bot
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate        # Linux/Mac
+venv\Scripts\activate           # Windows
+```
+
+### 2. Instale as dependências
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure as credenciais
+### 3. Configure as credenciais
 ```bash
 cp .env.example .env
-# Edite .env com suas chaves
+# Edite o .env com suas chaves
 ```
 
-### 3. Obtenha as credenciais
+### 4. Obtenha as credenciais
 
-| Credencial | Onde obter |
-|---|---|
-| `POLYGON_PRIVATE_KEY` | Sua wallet MetaMask → Export Private Key |
-| `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) |
-| `NEWS_API_KEY` | [newsapi.org](https://newsapi.org) (gratuito) |
-| USDC na Polygon | Compre em exchange → bridge para Polygon |
+| Credencial | Onde obter | Obrigatório |
+|---|---|---|
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) → API Keys | ✅ Sim |
+| `NEWS_API_KEY` | [newsapi.org](https://newsapi.org) → Get API Key | ❌ Opcional |
+| `POLYGON_PRIVATE_KEY` | MetaMask → Export Private Key | Só para apostas reais |
 
-> ⚠️ **NUNCA** compartilhe ou commite sua `POLYGON_PRIVATE_KEY`
+> ⚠️ **NUNCA** commite o arquivo `.env` no git. Ele já está no `.gitignore`.
 
-### 4. Execute em modo simulação (DRY_RUN=true)
+### 5. Rode em modo simulação
 ```bash
 python main.py
 ```
 
-### 5. Quando estiver confiante, ative apostas reais
-```bash
-# No .env:
+O bot vai listar mercados, analisar cada um com o LLaMA e mostrar uma tabela com recomendações — **sem fazer nenhuma aposta real**.
+
+---
+
+## Ativando apostas reais
+
+Quando estiver satisfeito com as análises, edite o `.env`:
+
+```env
 DRY_RUN=false
-MAX_BET_USDC=5      # comece pequeno!
+POLYGON_PRIVATE_KEY=sua_private_key_aqui
+MAX_BET_USDC=5        # comece pequeno!
 MAX_DAILY_USDC=20
 ```
 
-## Estrutura
+Você também precisará de **USDC na rede Polygon** na sua wallet.
+
+---
+
+## Estrutura do projeto
 
 ```
 polymarket-bot/
-├── main.py                    # Entry point
+├── main.py                      # Entry point
 ├── requirements.txt
-├── .env.example               # Template de configuração
+├── .env.example                 # Template — copie para .env
 ├── src/
-│   ├── config.py              # Carrega .env e valida
+│   ├── config.py                # Carrega e valida o .env
 │   ├── market/
-│   │   └── client.py          # API do Polymarket
+│   │   └── client.py            # Gamma API do Polymarket
 │   ├── analysis/
-│   │   ├── analyzer.py        # Claude analisa o mercado
-│   │   └── news.py            # Busca notícias (NewsAPI)
+│   │   ├── analyzer.py          # Groq/LLaMA analisa cada mercado
+│   │   └── news.py              # Busca notícias via NewsAPI
 │   └── execution/
-│       └── risk.py            # Kelly Criterion + limites diários
+│       └── risk.py              # Kelly Criterion + limites diários
 └── logs/
-    └── daily_ledger.json      # Registro de apostas por dia
+    └── daily_ledger.json        # Registro de apostas por dia
 ```
 
-## Parâmetros de risco
+---
+
+## Parâmetros de risco (.env)
 
 | Parâmetro | Descrição | Padrão |
 |---|---|---|
-| `MAX_BET_USDC` | Máximo por aposta | $10 |
-| `MAX_DAILY_USDC` | Limite diário total | $50 |
-| `MIN_EDGE` | Edge mínimo para apostar | 5% |
-| `DRY_RUN` | Simular sem apostar | `true` |
+| `DRY_RUN` | Simula sem apostar de verdade | `true` |
+| `MAX_BET_USDC` | Valor máximo por aposta | `10` |
+| `MAX_DAILY_USDC` | Limite de gasto diário total | `50` |
+| `MIN_EDGE` | Edge mínimo para recomendar aposta | `0.05` (5%) |
+
+O tamanho de cada aposta é calculado via **Kelly Criterion simplificado**, ajustado pelo nível de confiança do modelo (low / medium / high).
+
+---
+
+## Custo
+
+| Serviço | Custo |
+|---|---|
+| Groq (LLaMA 3.3 70B) | **Gratuito** — 14.400 req/dia |
+| NewsAPI | **Gratuito** — 100 req/dia |
+| Polymarket API | **Gratuito** |
+| USDC para apostas | Você define o valor |
+
+---
 
 ## ⚠️ Aviso
 
-Este bot é para fins educacionais. Trading em mercados de previsão envolve risco real de perda de capital. Comece sempre com `DRY_RUN=true` e valores pequenos.
+Este projeto é para fins educacionais. Trading em mercados de previsão envolve **risco real de perda de capital**. Sempre comece com `DRY_RUN=true`, avalie as análises por alguns dias antes de ativar apostas reais, e nunca arrisque mais do que pode perder.
