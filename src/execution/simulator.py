@@ -628,6 +628,101 @@ class TradingSimulator:
             if dd > self.stats.max_drawdown_pct:
                 self.stats.max_drawdown_pct = round(dd, 4)
 
+    # ── Helpers de teste (não usados em produção) ──────────────────────────────
+
+    def _place_trade_direct(self, mkt: dict, sym: str, sig, horiz: float, bid: float, ask: float):
+        """
+        Abre um trade diretamente, sem verificar cooldown/warmup.
+        Usado exclusivamente pelos testes unitários.
+        """
+        with self._lock:
+            if sig.direction == "YES":
+                from typing import Literal
+                action = "BUY_YES"
+                entry_price = ask
+                p_est = max(0.05, min(0.95, 0.5 + sig.edge))
+            else:
+                action = "BUY_NO"
+                entry_price = max(0.02, 1.0 - bid)
+                p_est = max(0.05, min(0.95, 0.5 + abs(sig.edge)))
+
+            entry_price = max(0.03, min(0.97, entry_price))
+            b = (1.0 / entry_price) - 1.0
+            q = 1.0 - p_est
+            kelly_raw = (b * p_est - q) / b if b > 0 else 0.0
+            kelly = max(0.0, min(kelly_raw, self.KELLY_FRACTION))
+            cmult = {"high": 1.0, "medium": 0.55}.get(sig.confidence, 0.3)
+            max_bet = self.stats.balance * self.MAX_POSITION_PCT
+            gross = round(kelly * max_bet * cmult, 2)
+            gross = max(gross, 0.10)
+            gross = min(gross, max_bet, self.stats.balance * 0.06)
+            fee = round(gross * POLYMARKET_FEE, 4)
+            amount = round(gross - fee, 4)
+            total_cost = gross
+            if total_cost > self.stats.balance:
+                return None
+
+            import uuid
+            trade = Trade(
+                id=str(uuid.uuid4())[:8],
+                symbol=sym,
+                question=mkt["question"][:100],
+                slug=mkt["slug"],
+                token_id=mkt["token_id"],
+                condition_id=mkt.get("condition_id", ""),
+                action=action,
+                amount_usdc=amount,
+                gross_usdc=gross,
+                fee_usdc=fee,
+                entry_price=entry_price,
+                entry_ts=time.time(),
+                horizon_min=horiz,
+                end_date_iso=mkt.get("end_date_iso", ""),
+                signal_edge=sig.edge,
+                signal_confidence=sig.confidence,
+                signal_reasons=sig.reasons[:],
+                signal_momentum_1m=sig.momentum_1m,
+                signal_momentum_5m=sig.momentum_5m,
+                signal_rsi=sig.rsi,
+                market_type=sig.market_type,
+                current_price=(ask if action == "BUY_YES" else 1.0 - bid),
+            )
+            self.stats.balance -= total_cost
+            self.stats.total_trades += 1
+            self.stats.total_wagered += total_cost
+            self.stats.total_fees += fee
+            self.open_trades.append(trade)
+        return trade
+
+    def close_trade(self, trade: Trade, won: bool, reason: str = "EXPIRED"):
+        """
+        Fecha um trade manualmente.
+        Usado exclusivamente pelos testes unitários.
+        """
+        with self._lock:
+            if trade not in self.open_trades:
+                return None
+            if won:
+                payout = trade.amount_usdc / trade.entry_price
+                pnl = payout - trade.amount_usdc
+                self.stats.wins += 1
+                self.stats.balance += payout
+            else:
+                pnl = -trade.amount_usdc
+                self.stats.losses += 1
+
+            trade.status = "CLOSED"
+            trade.exit_ts = time.time()
+            trade.exit_reason = reason
+            trade.pnl_usdc = round(pnl, 3)
+            trade.pnl_pct = round(pnl / trade.amount_usdc * 100, 1)
+            trade.won = won
+            trade.unrealized_pnl = 0.0
+            self.stats.total_pnl += pnl
+            self.open_trades.remove(trade)
+            self.closed_trades.append(trade)
+        return pnl
+
     def _log(self, event: str, msg: str, level: str = "info", **kw):
         e = {
             "ts":      time.time(),
