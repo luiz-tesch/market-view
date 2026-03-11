@@ -174,26 +174,8 @@ class TradingSimulator:
         condition_id: str = "",
         market_type:  str = "price",
     ):
-        # Só registra mercados de curto prazo
         if not (SHORT_TERM_MIN_MINUTES <= horizon_min <= SHORT_TERM_MAX_MINUTES):
             return
-        # ── Fase 1: registra mercado visto ──────────────────────────────────────
-        if self.collector and condition_id:
-            try:
-                class _M:
-                    pass
-                m = _M()
-                m.condition_id = condition_id
-                m.question     = question
-                m.symbol       = symbol
-                m.token_id     = token_id
-                m.no_token_id  = ""
-                m.end_date_iso = end_date_iso
-                m.liquidity    = 0.0
-                m.volume       = 0.0
-                self.collector.record_market(m)
-            except Exception:
-                pass
 
         self._markets[token_id] = {
             "token_id":    token_id,

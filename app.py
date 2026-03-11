@@ -54,7 +54,7 @@ _sse_lock = threading.Lock()
 def on_binance(sym: str, price: float, qty: float):
     if collector:
         try:
-            collector.record_tick(sym, ts, price, qty)
+            collector.record_tick(sym, time.time(), price, qty)
         except Exception:
             pass
     price_buffers[sym].push(price, qty)
@@ -213,18 +213,23 @@ def _load_markets():
     print(f"[App] {len(all_markets)} mercados totais | {len(short_markets)} short-term")
 
     for m in short_markets:
-        if m.symbol in price_buffers:
-            from src.signals.engine import detect_market_type
-            simulator.register_market(
-                token_id     = m.token_id,
-                question     = m.question,
-                slug         = m.slug,
-                symbol       = m.symbol,
-                horizon_min  = max(3.0, m.mins_left()),
-                yes_price    = m.yes_price,
-                end_date_iso = m.end_date_iso,
-                condition_id = m.condition_id,
-                market_type  = detect_market_type(m.question),
+      if m.symbol in price_buffers:
+          if collector:
+              try:
+                  collector.record_market(m)
+              except Exception:
+                  pass
+          from src.signals.engine import detect_market_type
+          simulator.register_market(
+              token_id     = m.token_id,
+              question     = m.question,
+              slug         = m.slug,
+              symbol       = m.symbol,
+              horizon_min  = max(3.0, m.mins_left()),
+              yes_price    = m.yes_price,
+              end_date_iso = m.end_date_iso,
+              condition_id = m.condition_id,
+              market_type  = detect_market_type(m.question),
             )
 
     if clob_feed and isinstance(clob_feed, MockClobFeed):
