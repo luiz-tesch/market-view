@@ -1,11 +1,16 @@
 """
-src/feed/polymarket.py  v2
-Correções:
-- BinanceFeed: fix detecção de símbolo (aggTrade stream case-insensitive)
-- msg_count duplicado removido do ClobFeed
-- fetch_gamma_markets: filtro SHORT_TERM (3-120 min) separado
-- enrich_prices: agora em background thread (não bloqueia startup)
-- CLOB resolve: função nova para buscar resolução real de mercados
+src/feed/polymarket.py  v2.2
+Correções v2.1:
+- enrich_prices_background: prioriza short-term markets (3-120min) antes de
+  enriquecer os demais, removendo o cap arbitrário de [:30]
+
+Correções v2.2:
+- fetch_market_resolution: reescrito com cascata de 3 fontes independentes
+  FONTE 1 — Gamma API: outcomePrices converge para ["1","0"] ou ["0","1"] na resolução
+  FONTE 2 — CLOB /markets/{id}: campo `tokens[].winner` + campo `resolved`
+  FONTE 3 — CLOB prices-history: convergência do preço para >= 0.97 ou <= 0.03
+  Razão: o CLOB raramente preenche `outcome` a tempo; o Gamma é mais rápido e
+  confiável para refletir a resolução real on-chain do CTF oracle (UMA).
 """
 from __future__ import annotations
 import asyncio
@@ -27,7 +32,6 @@ CLOB_URL   = "https://clob.polymarket.com"
 CLOB_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 BIN_WS     = "wss://stream.binance.com:9443/stream"
 
-# FIX: mapa completo em lowercase para match com data["s"].lower()
 SYMBOL_STREAMS: dict[str, str] = {
     "BTC":   "btcusdt",
     "ETH":   "ethusdt",
@@ -36,7 +40,6 @@ SYMBOL_STREAMS: dict[str, str] = {
     "MATIC": "maticusdt",
     "DOGE":  "dogeusdt",
 }
-# Inverso: "btcusdt" → "BTC"  (usado no handler do Binance)
 STREAM_TO_SYM: dict[str, str] = {v: k for k, v in SYMBOL_STREAMS.items()}
 
 CRYPTO_KEYWORDS: dict[str, list[str]] = {
@@ -58,7 +61,7 @@ POLYMARKET_FEE = 0.01   # 1% taxa maker/taker
 class PolyMarket:
     token_id:      str
     no_token_id:   str
-    condition_id:  str           # para buscar resolução real
+    condition_id:  str
     question:      str
     slug:          str
     symbol:        str
@@ -196,10 +199,7 @@ def fetch_gamma_markets(
 
 
 def fetch_short_term_markets(min_liquidity: float = 100.0) -> list[PolyMarket]:
-    """
-    Busca APENAS mercados de curto prazo (3–120 min).
-    Liquidez mínima maior para garantir spreads decentes.
-    """
+    """Busca APENAS mercados de curto prazo (3–120 min)."""
     all_markets  = fetch_gamma_markets(limit=500, min_liquidity=min_liquidity, max_days=1)
     short        = [m for m in all_markets if m.is_short_term()]
     print(f"[Gamma] Short-term ({SHORT_TERM_MIN_MINUTES}-{SHORT_TERM_MAX_MINUTES}min): {len(short)} mercados")
@@ -237,49 +237,176 @@ def clob_book(token_id: str) -> dict | None:
 
 def fetch_market_resolution(condition_id: str) -> bool | None:
     """
-    Busca se um mercado já resolveu e qual foi o resultado (YES=True / NO=False).
-    Retorna None se ainda não resolveu ou não encontrou.
-    
-    Usa o endpoint /markets do CLOB filtrado por condition_id.
+    Busca se um mercado já resolveu e qual foi o resultado.
+    Retorna True (YES venceu), False (NO venceu), ou None (não resolvido / erro).
+
+    Estratégia em cascata — 3 fontes independentes:
+
+    FONTE 1 — Gamma API (mais confiável para resolução)
+      Quando um mercado resolve, o Gamma atualiza outcomePrices para ["1","0"]
+      (YES ganhou) ou ["0","1"] (NO ganhou). Também expõe campo `closed: true`.
+      Esta é a fonte primária porque é onde a resolução é registrada primeiro.
+
+    FONTE 2 — CLOB REST /markets/{conditionId}
+      Fonte secundária. O campo `resolved` existe mas é preenchido com atraso.
+      Verificamos também os tokens: quando YES resolve $1, o token YES terá
+      `winner: true` na resposta do CLOB.
+
+    FONTE 3 — CLOB /prices-history (último preço convergiu para 0 ou 1)
+      Se os preços históricos do token YES convergiram para >= 0.97 ou <= 0.03,
+      o mercado provavelmente resolveu. Usado como fallback de último recurso.
+
+    Notas sobre o mecanismo real do Polymarket:
+    - Mercados short-term (crypto price) resolvem automaticamente via UMA oracle
+    - A resolução é on-chain: o smart contract do CTF atualiza o payout
+    - O Gamma API reflete isso em outcomePrices dentro de minutos
+    - O campo `outcome` do CLOB é frequentemente vazio mesmo após resolução
     """
     if not condition_id:
         return None
+
+    # ── FONTE 1: Gamma API ─────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            GAMMA_URL,
+            params={"conditionId": condition_id},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            items = r.json()
+            items = items if isinstance(items, list) else items.get("data", [])
+            for m in items:
+                if m.get("conditionId") != condition_id:
+                    continue
+
+                # Mercado ainda ativo — não resolveu
+                if m.get("active") and not m.get("closed"):
+                    return None
+
+                # outcomePrices converge para ["1","0"] ou ["0","1"] na resolução
+                try:
+                    prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
+                    yes_p  = float(prices[0])
+                    no_p   = float(prices[1]) if len(prices) > 1 else 1 - yes_p
+
+                    if yes_p >= 0.99:   # YES resolveu
+                        return True
+                    if no_p >= 0.99:    # NO resolveu (YES = 0)
+                        return False
+                except Exception:
+                    pass
+
+                # Fallback: campo outcome explícito no Gamma
+                outcome = m.get("outcome", "")
+                if isinstance(outcome, str) and outcome:
+                    up = outcome.strip().upper()
+                    if up in ("YES", "1", "TRUE", "WIN"):
+                        return True
+                    if up in ("NO", "0", "FALSE", "LOSS"):
+                        return False
+
+    except Exception as e:
+        print(f"[Resolution] Gamma source failed for {condition_id[:12]}: {e}")
+
+    # ── FONTE 2: CLOB /markets/{conditionId} ──────────────────────────────────
     try:
         r = requests.get(
             f"{CLOB_URL}/markets/{condition_id}",
             timeout=8,
         )
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        # Campo "resolved" + "outcome" no CLOB response
-        if data.get("resolved") or data.get("closed"):
-            outcome = data.get("outcome", "")
-            if isinstance(outcome, str):
-                return outcome.upper() in ("YES", "1", "TRUE", "WIN")
-            if isinstance(outcome, (int, float)):
-                return float(outcome) > 0.5
-        return None
+        if r.status_code == 200:
+            data = r.json()
+
+            # Campo resolved explícito (preenchido com atraso pelo CLOB)
+            if data.get("resolved"):
+                outcome = data.get("outcome", "")
+                if isinstance(outcome, str) and outcome:
+                    up = outcome.strip().upper()
+                    if up in ("YES", "1", "TRUE"):
+                        return True
+                    if up in ("NO", "0", "FALSE"):
+                        return False
+
+            # Tokens: winner:true indica qual lado venceu
+            tokens = data.get("tokens", [])
+            for token in tokens:
+                if token.get("winner") is True:
+                    outcome_name = token.get("outcome", "").upper()
+                    return outcome_name in ("YES", "1")
+
+    except Exception as e:
+        print(f"[Resolution] CLOB source failed for {condition_id[:12]}: {e}")
+
+    # ── FONTE 3: CLOB prices-history — convergência de preço ─────────────────
+    # Busca o token_id YES correspondente ao condition_id.
+    # Se o último preço histórico convergiu para >=0.97 ou <=0.03, inferimos resolução.
+    # Nota: esta fonte NÃO é 100% confiável — preços podem estar próximos de 0/1
+    # antes da resolução formal. Usar apenas se fontes 1 e 2 falharam.
+    try:
+        r = requests.get(
+            GAMMA_URL,
+            params={"conditionId": condition_id},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            items = r.json()
+            items = items if isinstance(items, list) else items.get("data", [])
+            for m in items:
+                if m.get("conditionId") != condition_id:
+                    continue
+                tids = json.loads(m.get("clobTokenIds", "[]"))
+                if not tids:
+                    break
+                yes_token = tids[0]
+
+                rh = requests.get(
+                    f"{CLOB_URL}/prices-history",
+                    params={"market": yes_token, "interval": "1m", "fidelity": 1},
+                    timeout=6,
+                )
+                if rh.status_code == 200:
+                    history = rh.json().get("history", [])
+                    if history:
+                        last_p = float(history[-1].get("p", 0.5))
+                        if last_p >= 0.97:
+                            return True
+                        if last_p <= 0.03:
+                            return False
+                break
     except Exception:
-        return None
+        pass
+
+    return None
 
 
 def enrich_prices_background(markets: list[PolyMarket]) -> None:
     """
     Atualiza yes_price dos mercados via CLOB REST em background thread.
-    NÃO bloqueia o startup do servidor.
+    FIX v2.1: prioriza short-term markets (que são os relevantes para o
+    simulador), depois enriquece os demais — sem cap arbitrário de [:30].
+
+    Rate limit amigável: 50ms entre requisições (~20 req/s).
     """
     def _worker():
-        for m in markets[:30]:
+        # Ordena: short-term primeiro (mais críticos para o simulador)
+        short_term = [m for m in markets if m.is_short_term()]
+        others     = [m for m in markets if not m.is_short_term()]
+        ordered    = short_term + others
+
+        enriched = 0
+        for m in ordered:
             try:
                 mid = clob_midpoint(m.token_id)
                 if mid is not None:
                     m.yes_price = mid
                     m.no_price  = 1 - mid
-                time.sleep(0.05)
+                    enriched += 1
+                time.sleep(0.05)   # 50ms entre requests
             except Exception:
                 pass
-        print("[CLOB] Preços enriquecidos em background")
+
+        print(f"[CLOB] {enriched}/{len(ordered)} preços enriquecidos em background "
+              f"({len(short_term)} short-term prioritários)")
 
     threading.Thread(target=_worker, daemon=True, name="EnrichPrices").start()
 
@@ -289,7 +416,6 @@ def enrich_prices_background(markets: list[PolyMarket]) -> None:
 class ClobFeed:
     """
     WebSocket CLOB do Polymarket — updates de preço em tempo real.
-    FIX v2: msg_count não duplicado; subscriptions em batch de 50.
     """
 
     def __init__(
@@ -303,7 +429,7 @@ class ClobFeed:
         self._thread:  threading.Thread | None = None
         self._loop:    asyncio.AbstractEventLoop | None = None
         self.connected = False
-        self.msg_count = 0          # FIX: incrementado apenas 1x por mensagem
+        self.msg_count = 0
         self.last_ts   = 0.0
         self.latencies: list[float] = []
         self._book:    dict[str, dict] = {}
@@ -399,7 +525,7 @@ class ClobFeed:
             ask = max(0.01, min(0.99, ask))
 
             self._book[asset_id] = {"bid": bid, "ask": ask}
-            self.msg_count += 1      # FIX: incremento único
+            self.msg_count += 1
             self.last_ts    = recv_ts
 
             ts_raw = msg.get("timestamp") or msg.get("ts")
@@ -423,7 +549,6 @@ class ClobFeed:
 class BinanceFeed:
     """
     aggTrade stream do Binance.
-    FIX v2: detecção de símbolo corrigida (case-insensitive, sem @aggTrade).
     """
 
     def __init__(self, symbols: list[str], on_tick: Callable[[str, float, float], None]):
@@ -464,8 +589,7 @@ class BinanceFeed:
                             break
                         data = json.loads(raw).get("data", {})
                         if data.get("e") == "aggTrade":
-                            # FIX: data["s"] = "BTCUSDT" → lowercase → "btcusdt" → lookup
-                            bin_sym = data["s"].lower()  # "btcusdt"
+                            bin_sym = data["s"].lower()
                             sym = STREAM_TO_SYM.get(bin_sym)
                             if sym and sym in self.symbols:
                                 p = float(data["p"])
@@ -560,7 +684,6 @@ class MockClobFeed:
     def _loop(self):
         t = 0
         while self._running:
-            # Só processa mercados ainda válidos (não expirados)
             active = [m for m in self.markets if m.mins_left() > 0.5]
             for m in active:
                 influence = 0.0
