@@ -1,7 +1,14 @@
 """
-Polymarket Paper Bot — Mercados 100% Reais + Simulação
+Polymarket Paper Bot v3 — Mercados Reais + Simulação Fiel
 Run: python app.py
 Open: http://localhost:5001
+
+Melhorias v3:
+- Foco em mercados SHORT-TERM (3–120 min)
+- enrich_prices em background (não bloqueia startup)
+- Painel mostra separadamente: todos os mercados vs. só short-term
+- Badges de feed live/mock atualizados
+- CLOB resolve real integrado ao simulador
 """
 from __future__ import annotations
 import json, queue, threading, time
@@ -9,7 +16,9 @@ from flask import Flask, Response, jsonify, render_template_string, request
 
 from src.signals.engine import PriceBuffer, compute_signal
 from src.feed.polymarket import (
-    fetch_gamma_markets, enrich_prices,
+    fetch_gamma_markets,
+    fetch_short_term_markets,
+    enrich_prices_background,
     ClobFeed, MockClobFeed,
     BinanceFeed, MockBinanceFeed,
     PolyMarket,
@@ -19,10 +28,11 @@ from src.execution.simulator import TradingSimulator
 app = Flask(__name__)
 
 # ── Globals ────────────────────────────────────────────────────────────────────
-SYMBOLS = ["BTC","ETH","SOL","BNB","MATIC","DOGE"]
+SYMBOLS = ["BTC", "ETH", "SOL", "BNB", "MATIC", "DOGE"]
 price_buffers: dict[str, PriceBuffer] = {s: PriceBuffer(maxlen=400) for s in SYMBOLS}
 simulator    = TradingSimulator(price_buffers)
-real_markets: list[PolyMarket] = []
+all_markets:   list[PolyMarket] = []
+short_markets: list[PolyMarket] = []
 binance_feed  = None
 clob_feed     = None
 IS_LIVE_BIN   = False
@@ -36,13 +46,13 @@ _sse_lock = threading.Lock()
 
 def on_binance(sym: str, price: float, qty: float):
     price_buffers[sym].push(price, qty)
-    _sse("tick", {"sym":sym, "price":price, "ts":time.time()})
+    _sse("tick", {"sym": sym, "price": price, "ts": time.time()})
 
 
 def on_clob(token_id: str, bid: float, ask: float):
     simulator.on_price_update(token_id, bid, ask)
-    mid = round((bid+ask)/2, 4)
-    _sse("clob", {"tid":token_id, "bid":round(bid,4), "ask":round(ask,4), "mid":mid})
+    mid = round((bid + ask) / 2, 4)
+    _sse("clob", {"tid": token_id, "bid": round(bid, 4), "ask": round(ask, 4), "mid": mid})
 
 
 # ── SSE ────────────────────────────────────────────────────────────────────────
@@ -52,83 +62,108 @@ def _sse(event: str, data: dict):
     with _sse_lock:
         dead = []
         for q in _sse_clients:
-            try: q.put_nowait(msg)
-            except queue.Full: dead.append(q)
-        for q in dead: _sse_clients.remove(q)
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _sse_clients.remove(q)
 
 
 @app.route("/stream")
 def stream():
     q: queue.Queue = queue.Queue(maxsize=150)
-    with _sse_lock: _sse_clients.append(q)
+    with _sse_lock:
+        _sse_clients.append(q)
+
     def gen():
         yield f"event: snapshot\ndata: {json.dumps(_snap())}\n\n"
         try:
             while True:
-                try: yield q.get(timeout=25)
-                except queue.Empty: yield ": ping\n\n"
+                try:
+                    yield q.get(timeout=25)
+                except queue.Empty:
+                    yield ": ping\n\n"
         except GeneratorExit:
             with _sse_lock:
-                if q in _sse_clients: _sse_clients.remove(q)
+                if q in _sse_clients:
+                    _sse_clients.remove(q)
+
     return Response(gen(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── API ────────────────────────────────────────────────────────────────────────
 
-@app.route("/api/snapshot")  
-def api_snap(): return jsonify(_snap())
+@app.route("/api/snapshot")
+def api_snap():
+    return jsonify(_snap())
 
 @app.route("/api/sim/toggle", methods=["POST"])
 def sim_toggle():
-    if simulator._running: simulator.stop()
-    else: simulator.start()
+    if simulator._running:
+        simulator.stop()
+    else:
+        simulator.start()
     return jsonify({"running": simulator._running})
 
 @app.route("/api/sim/reset", methods=["POST"])
 def sim_reset():
     simulator.reset()
-    return jsonify({"ok":True})
+    return jsonify({"ok": True})
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     threading.Thread(target=_load_markets, daemon=True).start()
-    return jsonify({"ok":True})
+    return jsonify({"ok": True})
 
 
 def _snap() -> dict:
-    sim = simulator.snapshot()
+    sim     = simulator.snapshot()
     signals = {}
     bufinfo = {}
+
     for sym, buf in price_buffers.items():
         p = buf.latest_price()
-        bufinfo[sym] = {"price":p,"ticks":len(buf.ticks),"candles":len(buf.candles_1m)}
+        bufinfo[sym] = {
+            "price": p, "ticks": len(buf.ticks),
+            "candles": len(buf.candles_1m),
+        }
         if p and len(buf.ticks) > 20:
             try:
                 sig = compute_signal(sym, buf, 0.5, 10)
                 signals[sym] = {
-                    "direction":sig.direction,"strength":round(sig.strength,3),
-                    "confidence":sig.confidence,"edge":round(sig.edge,4),
-                    "momentum_1m":round(sig.momentum_1m,3),"momentum_5m":round(sig.momentum_5m,3),
-                    "rsi":round(sig.rsi,1),"vwap_dev":round(sig.vwap_dev,3),
-                    "bb_position":round(sig.bb_position,3),"reasons":sig.reasons,
+                    "direction":    sig.direction,
+                    "strength":     round(sig.strength, 3),
+                    "confidence":   sig.confidence,
+                    "edge":         round(sig.edge, 4),
+                    "momentum_1m":  round(sig.momentum_1m, 3),
+                    "momentum_5m":  round(sig.momentum_5m, 3),
+                    "rsi":          round(sig.rsi, 1),
+                    "vwap_dev":     round(sig.vwap_dev, 3),
+                    "bb_position":  round(sig.bb_position, 3),
+                    "reasons":      sig.reasons,
+                    "market_type":  sig.market_type,
                 }
-            except Exception: pass
+            except Exception:
+                pass
 
-    lat  = clob_feed.avg_latency_ms() if clob_feed and hasattr(clob_feed,"avg_latency_ms") else 0.0
-    msgs = clob_feed.msg_count if clob_feed and hasattr(clob_feed,"msg_count") else 0
+    lat  = clob_feed.avg_latency_ms() if clob_feed and hasattr(clob_feed, "avg_latency_ms") else 0.0
+    msgs = clob_feed.msg_count if clob_feed and hasattr(clob_feed, "msg_count") else 0
 
     return {
         **sim,
-        "signals": signals,
-        "buffers": bufinfo,
-        "real_markets": [m.to_dict() for m in real_markets],
+        "signals":       signals,
+        "buffers":       bufinfo,
+        "all_markets":   [m.to_dict() for m in all_markets],
+        "short_markets": [m.to_dict() for m in short_markets],
         "feed": {
-            "binance_live":IS_LIVE_BIN,
-            "clob_live":IS_LIVE_CLOB,
-            "clob_lat_ms":round(lat,1),
-            "clob_msgs":msgs,
-            "market_count":len(real_markets),
+            "binance_live": IS_LIVE_BIN,
+            "clob_live":    IS_LIVE_CLOB,
+            "clob_lat_ms":  round(lat, 1),
+            "clob_msgs":    msgs,
+            "total_markets":    len(all_markets),
+            "short_markets":    len(short_markets),
         },
     }
 
@@ -136,63 +171,71 @@ def _snap() -> dict:
 # ── Market loading ─────────────────────────────────────────────────────────────
 
 def _load_markets():
-    global real_markets
-    print("[App] Buscando mercados cripto reais do Polymarket...")
-    markets = fetch_gamma_markets(limit=300, min_liquidity=50, max_days=90)
+    global all_markets, short_markets
+
+    print("[App] Buscando mercados do Polymarket...")
+    markets = fetch_gamma_markets(limit=400, min_liquidity=50, max_days=90)
 
     if not markets:
         print("[App] API indisponível — usando mercados demo")
         markets = _demo()
 
-    # Enriquece preços via CLOB REST (amostra dos 30 maiores por liquidez)
-    top30 = sorted(markets, key=lambda m: m.liquidity, reverse=True)[:30]
-    enrich_prices(top30)
+    # Enriquece preços em BACKGROUND (não bloqueia)
+    enrich_prices_background(markets)
 
-    real_markets = markets
-    print(f"[App] {len(real_markets)} mercados carregados")
+    all_markets   = markets
+    short_markets = [m for m in markets if m.is_short_term()]
+    print(f"[App] {len(all_markets)} mercados totais | {len(short_markets)} short-term")
 
-    # Registra no simulador (filtra por símbolos com feed de preço)
-    for m in real_markets:
+    # Registra short-term no simulador
+    for m in short_markets:
         if m.symbol in price_buffers:
+            from src.signals.engine import detect_market_type
             simulator.register_market(
-                token_id=m.token_id,
-                question=m.question,
-                slug=m.slug,
-                symbol=m.symbol,
-                horizon_min=max(1.0, m.mins_left()),
-                yes_price=m.yes_price,
-                end_date_iso=m.end_date_iso,
+                token_id     = m.token_id,
+                question     = m.question,
+                slug         = m.slug,
+                symbol       = m.symbol,
+                horizon_min  = max(3.0, m.mins_left()),
+                yes_price    = m.yes_price,
+                end_date_iso = m.end_date_iso,
+                condition_id = m.condition_id,
+                market_type  = detect_market_type(m.question),
             )
 
-    # Atualiza CLOB mock com mercados frescos
     if clob_feed and isinstance(clob_feed, MockClobFeed):
-        clob_feed.markets = real_markets
+        clob_feed.markets = markets
 
-    _sse("markets_loaded", {"count": len(real_markets)})
+    _sse("markets_loaded", {"total": len(all_markets), "short": len(short_markets)})
 
 
 def _demo() -> list[PolyMarket]:
-    """Mercados demo hardcoded caso a API esteja fora."""
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
     demos = [
-        ("Will BTC be above $90,000 in March 2025?",   "BTC", 0.38, now+timedelta(days=21)),
-        ("Will BTC be above $100,000 in 2025?",        "BTC", 0.55, now+timedelta(days=180)),
-        ("Will ETH be above $4,000 in March 2025?",    "ETH", 0.29, now+timedelta(days=21)),
-        ("Will ETH hit $5,000 before June 2025?",      "ETH", 0.22, now+timedelta(days=90)),
-        ("Will SOL reach $300 in 2025?",               "SOL", 0.31, now+timedelta(days=200)),
-        ("Will SOL be above $180 by end of March?",    "SOL", 0.44, now+timedelta(days=21)),
-        ("Will BNB reach $1,000 in 2025?",             "BNB", 0.18, now+timedelta(days=270)),
-        ("Will BTC close above $85k this week?",       "BTC", 0.41, now+timedelta(days=5)),
+        ("Will BTC be above $90,000 in 45 min?",         "BTC", 0.38, now + timedelta(minutes=45)),
+        ("Will BTC be above $85,000 in the next hour?",   "BTC", 0.55, now + timedelta(hours=1)),
+        ("Will ETH be above $3,200 in the next 30 min?",  "ETH", 0.47, now + timedelta(minutes=30)),
+        ("Will ETH stay above $3,000 for 2 hours?",       "ETH", 0.62, now + timedelta(hours=2)),
+        ("Will SOL hit $150 in the next hour?",            "SOL", 0.31, now + timedelta(minutes=55)),
+        ("Will BTC drop below $80,000 today?",             "BTC", 0.22, now + timedelta(hours=90)),
+        ("Will BNB reach $600 in 2 hours?",                "BNB", 0.18, now + timedelta(hours=2)),
+        ("Will BTC close above $85k in 20 minutes?",       "BTC", 0.41, now + timedelta(minutes=20)),
     ]
     result = []
-    for i,(q,sym,p,end) in enumerate(demos):
+    for i, (q, sym, p, end) in enumerate(demos):
         result.append(PolyMarket(
-            token_id=f"demo_yes_{i:04d}", no_token_id=f"demo_no_{i:04d}",
-            question=q, slug=f"demo-{i}", symbol=sym,
-            end_date_iso=end.isoformat().replace("+00:00","Z"),
-            yes_price=p, no_price=1-p,
-            volume=50000+i*15000, liquidity=5000+i*2000,
+            token_id     = f"demo_yes_{i:04d}",
+            no_token_id  = f"demo_no_{i:04d}",
+            condition_id = f"demo_cid_{i:04d}",
+            question     = q,
+            slug         = f"demo-{i}",
+            symbol       = sym,
+            end_date_iso = end.isoformat().replace("+00:00", "Z"),
+            yes_price    = p,
+            no_price     = 1 - p,
+            volume       = 50000 + i * 15000,
+            liquidity    = 5000 + i * 2000,
         ))
     return result
 
@@ -202,68 +245,91 @@ def _demo() -> list[PolyMarket]:
 def startup():
     global binance_feed, clob_feed, IS_LIVE_BIN, IS_LIVE_CLOB
 
-    # 1. Busca mercados reais
+    # 1. Mercados (rápido — enrich em background)
     _load_markets()
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     # 2. Binance feed
     try:
         import websockets  # noqa
         bf = BinanceFeed(SYMBOLS, on_binance)
-        bf.start(); time.sleep(2.5)
+        bf.start()
+        time.sleep(2.5)
         if bf.connected:
-            binance_feed = bf; IS_LIVE_BIN = True
+            binance_feed = bf
+            IS_LIVE_BIN  = True
             print("[App] ✓ Binance WebSocket live")
         else:
-            raise ConnectionError
+            raise ConnectionError("Binance não conectou")
     except Exception as e:
         print(f"[App] Binance mock ({e})")
         bf = MockBinanceFeed(SYMBOLS, on_binance)
-        bf.start(); binance_feed = bf
+        bf.start()
+        binance_feed = bf
 
     # 3. CLOB WebSocket
-    token_ids = [m.token_id for m in real_markets if m.token_id]
+    token_ids = [m.token_id for m in all_markets if m.token_id]
     try:
         import websockets  # noqa
         cf = ClobFeed(token_ids=token_ids, on_update=on_clob)
-        cf.start(); time.sleep(3.5)
+        cf.start()
+        time.sleep(3.5)
         if cf.connected:
-            clob_feed = cf; IS_LIVE_CLOB = True
+            clob_feed    = cf
+            IS_LIVE_CLOB = True
             print("[App] ✓ CLOB WebSocket live")
         else:
-            raise ConnectionError
+            raise ConnectionError("CLOB não conectou")
     except Exception as e:
         print(f"[App] CLOB mock ({e})")
-        cf = MockClobFeed(markets=real_markets, on_update=on_clob, price_buffers=price_buffers)
-        cf.start(); clob_feed = cf
+        cf = MockClobFeed(markets=all_markets, on_update=on_clob, price_buffers=price_buffers)
+        cf.start()
+        clob_feed = cf
 
-    # 4. Aguarda buffers aquecerem um pouco e inicia simulador
+    # 4. Aguarda buffers aquecerem
     time.sleep(2)
     simulator.start()
-    print("[App] ✓ Simulador iniciado")
+    print("[App] ✓ Simulador iniciado (foco short-term)")
 
-    # 5. Push periódico de snapshot
+    # 5. Pusher periódico
     def pusher():
         while True:
             time.sleep(2)
-            try: _sse("snapshot", _snap())
-            except Exception: pass
+            try:
+                _sse("snapshot", _snap())
+            except Exception:
+                pass
+
     threading.Thread(target=pusher, daemon=True).start()
+
+    # 6. Refresh periódico de short-term markets (a cada 5 min)
+    def market_refresher():
+        while True:
+            time.sleep(300)
+            try:
+                _load_markets()
+            except Exception as e:
+                print(f"[App] Market refresh error: {e}")
+
+    threading.Thread(target=market_refresher, daemon=True).start()
 
 
 threading.Thread(target=startup, daemon=True).start()
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
+
 @app.route("/")
-def index(): return render_template_string(DASHBOARD)
+def index():
+    return render_template_string(DASHBOARD)
+
 
 DASHBOARD = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Polymarket Paper Bot</title>
+<title>Polymarket Paper Bot v3</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -275,18 +341,15 @@ DASHBOARD = r"""<!DOCTYPE html>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;overflow:hidden;background:var(--bg)}
 body{color:var(--txt);font-family:var(--fm);font-size:11px}
-/* subtle radial glow */
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(ellipse 60% 40% at 5% 5%,rgba(0,194,255,.04),transparent 55%),
              radial-gradient(ellipse 40% 60% at 95% 95%,rgba(0,230,118,.03),transparent 55%)}
-/* scanlines */
 body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;
   background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,194,255,.005) 4px)}
-
 .app{display:grid;grid-template-rows:44px 1fr;height:100vh;position:relative;z-index:1}
 
 /* NAV */
-nav{display:flex;align-items:center;padding:0 14px;gap:14px;
+nav{display:flex;align-items:center;padding:0 14px;gap:12px;
     background:rgba(1,4,8,.96);border-bottom:1px solid var(--b);backdrop-filter:blur(10px)}
 .brand{font-family:var(--fh);font-size:13px;font-weight:900;letter-spacing:.12em;
        color:var(--wht);display:flex;align-items:center;gap:8px}
@@ -297,7 +360,8 @@ nav{display:flex;align-items:center;padding:0 14px;gap:14px;
 .tag-live{background:rgba(0,230,118,.1);color:var(--grn);border:1px solid rgba(0,230,118,.3)}
 .tag-mock{background:rgba(255,214,0,.1);color:var(--yel);border:1px solid rgba(255,214,0,.3)}
 .tag-warm{background:rgba(255,109,0,.1);color:var(--ora);border:1px solid rgba(255,109,0,.3);animation:pulse .9s infinite}
-.nv{display:flex;gap:18px;margin-left:auto;align-items:center}
+.tag-short{background:rgba(170,0,255,.1);color:var(--pur);border:1px solid rgba(170,0,255,.3)}
+.nv{display:flex;gap:16px;margin-left:auto;align-items:center}
 .ns{display:flex;flex-direction:column;align-items:flex-end}
 .nl{font-size:7px;letter-spacing:.18em;color:var(--dim);text-transform:uppercase}
 .nv_{font-size:13px;font-weight:700;font-family:var(--fh)}
@@ -311,7 +375,7 @@ nav{display:flex;align-items:center;padding:0 14px;gap:14px;
 .btn-ref{border-color:rgba(0,194,255,.3);color:rgba(0,194,255,.6)}
 .btn-ref:hover{border-color:var(--acc);color:var(--acc)}
 
-/* GRID */
+/* LAYOUT */
 .grid{display:grid;grid-template-columns:252px 1fr 300px;height:100%;overflow:hidden}
 .col{border-right:1px solid var(--b);overflow:hidden;display:flex;flex-direction:column}
 .col:last-child{border-right:none;border-left:1px solid var(--b)}
@@ -336,6 +400,7 @@ canvas.spark{display:block;width:100%;height:28px;margin-bottom:5px}
 .c-med{background:rgba(255,214,0,.07);color:var(--yel);border-color:rgba(255,214,0,.25)}
 .c-lo {background:rgba(18,40,64,.2);color:var(--dim);border-color:var(--b)}
 .c-pur{background:rgba(170,0,255,.06);color:var(--pur);border-color:rgba(170,0,255,.2)}
+.c-ev {background:rgba(255,109,0,.06);color:var(--ora);border-color:rgba(255,109,0,.2)}
 .inds{display:grid;grid-template-columns:1fr 1fr;gap:2px}
 .ind{background:var(--s2);padding:2px 6px}
 .il{font-size:6px;letter-spacing:.15em;color:var(--dim);text-transform:uppercase}
@@ -343,19 +408,28 @@ canvas.spark{display:block;width:100%;height:28px;margin-bottom:5px}
 .pos{color:var(--grn)!important}.neg{color:var(--red)!important}.neu{color:var(--dim)!important}
 .reasons{font-size:7px;color:var(--dim);margin-top:3px;line-height:1.7}
 
-/* MARKETS TABLE */
+/* TABS */
+.tabs{display:flex;border-bottom:1px solid var(--b);flex-shrink:0;background:var(--s1)}
+.tab{font-family:var(--fh);font-size:7px;font-weight:700;letter-spacing:.15em;
+     text-transform:uppercase;padding:7px 12px;cursor:pointer;color:var(--dim);
+     border-bottom:2px solid transparent;transition:.12s}
+.tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+.tab-cnt{font-size:8px;margin-left:4px;color:var(--pur)}
+
+/* MARKETS */
 .mhdr,.mrow{display:grid;grid-template-columns:1fr 56px 50px 46px;gap:4px;
             padding:6px 10px;border-bottom:1px solid rgba(11,25,40,.8);align-items:start}
 .mhdr{background:rgba(4,8,15,.95);position:sticky;top:0;z-index:5;
       font-size:7px;letter-spacing:.12em;color:var(--dim);text-transform:uppercase}
 .mrow:hover{background:rgba(255,255,255,.01)}
 .mq{font-size:8px;color:var(--wht);line-height:1.35}
-.msub{font-size:7px;color:var(--dim);margin-top:2px;display:flex;gap:6px}
+.msub{font-size:7px;color:var(--dim);margin-top:2px;display:flex;gap:6px;flex-wrap:wrap}
 .mp{font-family:var(--fh);font-size:10px;font-weight:700;text-align:right}
-.mc{text-align:center}
-.mt{font-size:7px;text-align:right;color:var(--dim)}
+.mc{text-align:center}.mt{font-size:7px;text-align:right;color:var(--dim)}
 .vbar{height:2px;background:var(--b);margin-top:2px;border-radius:1px;overflow:hidden}
 .vfill{height:100%;background:rgba(0,194,255,.25);border-radius:1px}
+.short-badge{font-size:6px;padding:1px 3px;background:rgba(170,0,255,.1);
+             color:var(--pur);border:1px solid rgba(170,0,255,.2);border-radius:1px}
 
 /* STATS */
 .strip{display:grid;grid-template-columns:repeat(6,1fr);border-bottom:1px solid var(--b);flex-shrink:0}
@@ -393,6 +467,9 @@ canvas.spark{display:block;width:100%;height:28px;margin-bottom:5px}
 .tg-o{background:rgba(0,194,255,.04);color:var(--acc);border-color:rgba(0,194,255,.12)}
 .tg-c{background:rgba(18,40,64,.2);color:var(--dim);border-color:var(--b)}
 .tg-k{background:var(--s1);color:var(--dim);border-color:var(--b)}
+.tg-fee{background:rgba(255,109,0,.05);color:var(--ora);border-color:rgba(255,109,0,.15)}
+.tg-real{background:rgba(0,230,118,.1);color:var(--grn);border-color:rgba(0,230,118,.3)}
+.tg-sim{background:rgba(255,214,0,.07);color:var(--yel);border-color:rgba(255,214,0,.2)}
 .prog{height:2px;background:var(--b);margin-top:3px;overflow:hidden}
 .progf{height:100%;background:rgba(0,194,255,.5);transition:width 1s linear}
 
@@ -400,14 +477,13 @@ canvas.spark{display:block;width:100%;height:28px;margin-bottom:5px}
 .loge{padding:4px 9px;border-left:2px solid;font-size:8px;line-height:1.5;animation:fadein .18s ease}
 .lo{border-left-color:var(--acc)}.lw{border-left-color:var(--grn);background:rgba(0,230,118,.015)}
 .ll{border-left-color:var(--red);background:rgba(255,23,68,.015)}
-.ls{border-left-color:var(--yel)}.lk{border-left-color:var(--b);opacity:.55}.lo2{border-left-color:var(--dim)}
+.ls{border-left-color:var(--yel)}.lk{border-left-color:var(--b);opacity:.55}
+.lo2{border-left-color:var(--dim)}.lr{border-left-color:var(--pur)}
 .lts{color:var(--dim);margin-right:4px}.lev{font-weight:700;letter-spacing:.06em;margin-right:4px}
 
-/* flash */
 .fu{animation:fu .35s ease}.fd{animation:fd .35s ease}
 @keyframes fu{0%{color:var(--grn)}100%{}}@keyframes fd{0%{color:var(--red)}100%{}}
 
-/* scroll */
 ::-webkit-scrollbar{width:2px}::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--b2)}
 .empty{padding:16px;text-align:center;color:var(--dim);font-size:8.5px;letter-spacing:.1em;line-height:2.2}
@@ -416,34 +492,37 @@ canvas.spark{display:block;width:100%;height:28px;margin-bottom:5px}
 <body>
 <div class="app">
 
-<!-- NAV -->
 <nav>
-  <div class="brand"><div class="dot"></div>POLYMARKET PAPER BOT</div>
+  <div class="brand"><div class="dot"></div>POLYMARKET PAPER BOT <span style="font-size:9px;opacity:.5">v3</span></div>
   <span id="b-bin" class="tag tag-mock">◯ BIN MOCK</span>
   <span id="b-clob" class="tag tag-mock">◯ CLOB MOCK</span>
   <span id="b-warm" class="tag tag-warm" style="display:none">⏳ WARM-UP</span>
+  <span id="b-short" class="tag tag-short">0 SHORT</span>
   <div class="nv">
     <div class="ns"><span class="nl">Balance</span><span class="nv_" id="n-bal" style="color:var(--grn)">$100</span></div>
     <div class="ns"><span class="nl">P&L</span><span class="nv_" id="n-pnl">$0</span></div>
     <div class="ns"><span class="nl">Win Rate</span><span class="nv_" id="n-wr" style="color:var(--acc)">—</span></div>
-    <div class="ns"><span class="nl">Mercados</span><span class="nv_" id="n-mkts" style="color:var(--yel)">—</span></div>
+    <div class="ns"><span class="nl">Fees Pagas</span><span class="nv_" id="n-fees" style="color:var(--ora)">$0</span></div>
     <div class="ns"><span class="nl">CLOB lat</span><span class="nv_" id="n-lat">—</span></div>
     <button class="btn btn-run" id="btn-tog" onclick="toggleSim()">▶ START</button>
     <button class="btn btn-reset" onclick="resetSim()">↺ RESET</button>
-    <button class="btn btn-ref" onclick="refreshMarkets()">⟳ MERCADOS</button>
+    <button class="btn btn-ref" onclick="refreshMarkets()">⟳ REFRESH</button>
   </div>
 </nav>
 
 <div class="grid">
-  <!-- LEFT: Spot + Mercados Reais -->
+  <!-- LEFT -->
   <div class="col">
     <div class="chd">Spot Prices <span id="hbin" style="font-size:7px"></span></div>
     <div class="cscroll" id="spot"></div>
-    <div class="chd">Mercados Reais Polymarket <span id="hmkts" style="color:var(--acc);font-size:8px"></span></div>
+    <div class="tabs">
+      <div class="tab active" id="tab-short" onclick="setTab('short')">Short-Term <span class="tab-cnt" id="cnt-short">0</span></div>
+      <div class="tab" id="tab-all" onclick="setTab('all')">Todos <span class="tab-cnt" id="cnt-all">0</span></div>
+    </div>
     <div class="cscroll" id="mkts"></div>
   </div>
 
-  <!-- CENTER: Stats + Equity + Trades -->
+  <!-- CENTER -->
   <div class="col">
     <div class="strip">
       <div class="sc g"><div class="scl">Balance</div><div class="scv" id="s-bal">$100</div></div>
@@ -461,7 +540,7 @@ canvas.spark{display:block;width:100%;height:28px;margin-bottom:5px}
     <div class="cscroll" id="trades"></div>
   </div>
 
-  <!-- RIGHT: Log -->
+  <!-- RIGHT -->
   <div class="col">
     <div class="chd">Activity Log <span id="log-cnt" style="font-size:7.5px;color:var(--dim)"></span></div>
     <div class="cscroll" id="log" style="padding:3px 6px;display:flex;flex-direction:column;gap:2px"></div>
@@ -470,84 +549,94 @@ canvas.spark{display:block;width:100%;height:28px;margin-bottom:5px}
 </div>
 
 <script>
-let snap = {}, eq = [{ts:Date.now()/1e3,v:100}], ph = {}, prevPx = {}, maxVol = 1;
-const SYMS = ['BTC','ETH','SOL','BNB','MATIC','DOGE'];
-SYMS.forEach(s => ph[s] = []);
+let snap={}, eq=[{ts:Date.now()/1e3,v:100}], ph={}, prevPx={}, maxVol=1;
+let activeTab='short';
+const SYMS=['BTC','ETH','SOL','BNB','MATIC','DOGE'];
+SYMS.forEach(s=>ph[s]=[]);
 
-// SSE
 (function conn(){
-  const es = new EventSource('/stream');
-  es.addEventListener('snapshot', e => apply(JSON.parse(e.data)));
-  es.addEventListener('tick', e => {
-    const d = JSON.parse(e.data);
+  const es=new EventSource('/stream');
+  es.addEventListener('snapshot',e=>apply(JSON.parse(e.data)));
+  es.addEventListener('tick',e=>{
+    const d=JSON.parse(e.data);
     if(ph[d.sym]){ph[d.sym].push(d.price);if(ph[d.sym].length>80)ph[d.sym].shift();}
-    flashPx(d.sym, d.price);
+    flashPx(d.sym,d.price);
   });
-  es.onerror = ()=>{setTimeout(conn,3000);es.close();};
+  es.onerror=()=>{setTimeout(conn,3000);es.close();};
 })();
 setInterval(async()=>{try{apply(await(await fetch('/api/snapshot')).json())}catch{}},5000);
 
-function apply(d){
-  snap = d;
-  const st = d.stats||{}, bal = st.balance??100, pnl = st.total_pnl??0;
-  const w = st.wins??0, l = st.losses??0;
-  const wr = w+l>0?(w/(w+l)*100).toFixed(0)+'%':'—';
+function setTab(t){
+  activeTab=t;
+  document.getElementById('tab-short').classList.toggle('active',t==='short');
+  document.getElementById('tab-all').classList.toggle('active',t==='all');
+  renderMarkets(snap.short_markets||[],snap.all_markets||[],snap.signals||{});
+}
 
-  // Nav
+function apply(d){
+  snap=d;
+  const st=d.stats||{},bal=st.balance??100,pnl=st.total_pnl??0;
+  const w=st.wins??0,l=st.losses??0;
+  const wr=w+l>0?(w/(w+l)*100).toFixed(0)+'%':'—';
+
   set('n-bal','$'+bal.toFixed(2),bal>=100?'var(--grn)':'var(--red)');
   setPnl('n-pnl',pnl);
   set('n-wr',wr,'var(--acc)');
-  set('n-mkts',(d.real_markets||[]).length,'var(--yel)');
-  const lat = d.feed?.clob_lat_ms??0;
+  set('n-fees','$'+(st.total_fees||0).toFixed(3),'var(--ora)');
+  const lat=d.feed?.clob_lat_ms??0;
   set('n-lat',lat>0?lat.toFixed(1)+'ms':'—',lat<30?'var(--grn)':lat<100?'var(--yel)':'var(--red)');
 
-  // Feed badges
   ['bin','clob'].forEach(k=>{
-    const live = d.feed?.[k==='bin'?'binance_live':'clob_live'];
-    const el = document.getElementById('b-'+k);
-    el.textContent = live?`⬤ ${k.toUpperCase()} LIVE`:`◯ ${k.toUpperCase()} MOCK`;
+    const live=d.feed?.[k==='bin'?'binance_live':'clob_live'];
+    const el=document.getElementById('b-'+k);
+    el.textContent=live?`⬤ ${k.toUpperCase()} LIVE`:`◯ ${k.toUpperCase()} MOCK`;
     el.className='tag '+(live?'tag-live':'tag-mock');
   });
   set('hbin',d.feed?.binance_live?'● LIVE':'◯ MOCK',d.feed?.binance_live?'var(--grn)':'var(--yel)');
 
-  const wu = st.warmup_remaining??0;
-  const bwu = document.getElementById('b-warm');
-  bwu.style.display = wu>0?'inline-block':'none';
+  const sc=d.feed?.short_markets??0;
+  const bshort=document.getElementById('b-short');
+  bshort.textContent=`${sc} SHORT`;
+  bshort.style.display=sc>0?'inline-block':'none';
+
+  const wu=st.warmup_remaining??0;
+  const bwu=document.getElementById('b-warm');
+  bwu.style.display=wu>0?'inline-block':'none';
   if(wu>0)bwu.textContent=`⏳ WARM-UP ${wu}s`;
 
-  const btn = document.getElementById('btn-tog');
-  btn.textContent = d.running?'■ RUNNING':'▶ START';
+  const btn=document.getElementById('btn-tog');
+  btn.textContent=d.running?'■ RUNNING':'▶ START';
   btn.className='btn '+(d.running?'btn-stop':'btn-run');
 
-  // Stats strip
   set('s-bal','$'+bal.toFixed(0));
-  const pe = document.getElementById('s-pnl');
+  const pe=document.getElementById('s-pnl');
   pe.textContent=(pnl>=0?'+$':'-$')+Math.abs(pnl).toFixed(2);
   pe.style.color=pnl>=0?'var(--grn)':'var(--red)';
   set('s-roi',(((bal-100)/100)*100).toFixed(1)+'% ROI');
-  const ot = d.open_trades||[];
+  const ot=d.open_trades||[];
   set('s-open',ot.length);
-  const unr = ot.reduce((s,t)=>s+(t.unrealized_pnl||0),0);
+  const unr=ot.reduce((s,t)=>s+(t.unrealized_pnl||0),0);
   set('s-unr',(unr>=0?'+':'')+'$'+Math.abs(unr).toFixed(2)+' unreal');
-  set('s-wins',w); set('s-loss',l);
+  set('s-wins',w);set('s-loss',l);
   set('s-avgw','avg $'+(st.avg_win_usdc||0).toFixed(2));
   set('s-avgl','avg $'+(st.avg_loss_usdc||0).toFixed(2));
   set('s-dd',((st.max_drawdown_pct||0)*100).toFixed(1)+'%');
-  if(wu>0) set('s-streak',`⏳ ${wu}s`,'var(--ora)');
+  if(wu>0)set('s-streak',`⏳ ${wu}s`,'var(--ora)');
   else set('s-streak',st.win_streak>1?`🔥${st.win_streak}x`:st.loss_streak>1?`❌${st.loss_streak}x`:'');
   set('pos-cnt',ot.length?ot.length+' open':'');
 
-  // Equity
-  if(d.equity_curve?.length) eq = d.equity_curve.map(([ts,v])=>({ts,v}));
+  if(d.equity_curve?.length)eq=d.equity_curve.map(([ts,v])=>({ts,v}));
   drawEq();
-  set('eq-sub',`wagered $${(st.total_wagered||0).toFixed(2)} · ${st.total_trades||0} trades`);
+  set('eq-sub',`fees $${(st.total_fees||0).toFixed(3)} · wagered $${(st.total_wagered||0).toFixed(2)} · ${st.total_trades||0} trades`);
+
+  set('cnt-short',(d.short_markets||[]).length);
+  set('cnt-all',(d.all_markets||[]).length);
 
   renderSpot(d.signals||{},d.buffers||{});
-  renderMarkets(d.real_markets||[],d.signals||{});
+  renderMarkets(d.short_markets||[],d.all_markets||[],d.signals||{});
   renderTrades(ot,d.closed_trades||[]);
   renderLog(d.event_log||[]);
   set('log-cnt',(d.event_log||[]).length);
-  set('hmkts',(d.real_markets||[]).length);
 }
 
 function set(id,v,c){const e=document.getElementById(id);if(!e)return;e.textContent=v;if(c)e.style.color=c;}
@@ -555,6 +644,7 @@ function setPnl(id,v){const e=document.getElementById(id);if(!e)return;e.textCon
 function fPx(s,p){if(!p)return'—';if(s==='BTC')return'$'+Math.round(p).toLocaleString();if(s==='ETH')return'$'+p.toFixed(1);return'$'+p.toFixed(3);}
 function fNum(n){if(!n)return'0';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(0)+'k';return n.toFixed(0);}
 function fTime(m){if(m<60)return Math.round(m)+'m';if(m<1440)return(m/60).toFixed(1)+'h';return(m/1440).toFixed(1)+'d';}
+
 function flashPx(sym,p){
   const el=document.getElementById('px-'+sym);if(!el)return;
   const pr=prevPx[sym];
@@ -562,7 +652,7 @@ function flashPx(sym,p){
   el.textContent=fPx(sym,p);prevPx[sym]=p;
 }
 
-function renderSpot(sigs, bufs){
+function renderSpot(sigs,bufs){
   const c=document.getElementById('spot');
   let h='';
   for(const sym of SYMS){
@@ -571,6 +661,7 @@ function renderSpot(sigs, bufs){
     const dir=sig.direction||'SKIP';
     const dc=dir==='YES'?'c-yes':dir==='NO'?'c-no':'c-skip';
     const cc=sig.confidence==='high'?'c-hi':sig.confidence==='medium'?'c-med':'c-lo';
+    const mt=sig.market_type||'price';
     const m1=sig.momentum_1m||0,m5=sig.momentum_5m||0,r=sig.rsi||50,vd=sig.vwap_dev||0,bb=sig.bb_position||.5;
     h+=`<div class="spot">
       <div class="st"><span class="sn">${sym}</span><span class="sp" id="px-${sym}">${fPx(sym,p)}</span></div>
@@ -579,6 +670,7 @@ function renderSpot(sigs, bufs){
         <span class="chip ${dc}">${dir==='YES'?'▲ YES':dir==='NO'?'▼ NO':'— SKIP'}</span>
         <span class="chip ${cc}">${sig.confidence||'—'}</span>
         ${sig.edge!=null?`<span class="chip c-pur">e${(sig.edge*100).toFixed(1)}%</span>`:''}
+        <span class="chip ${mt==='price'?'c-hi':'c-ev'}">${mt}</span>
       </div>
       <div class="inds">
         <div class="ind"><div class="il">mom1m</div><div class="iv ${m1>0?'pos':m1<0?'neg':'neu'}">${m1>=0?'+':''}${m1.toFixed(2)}%</div></div>
@@ -598,9 +690,13 @@ function renderSpot(sigs, bufs){
   });
 }
 
-function renderMarkets(markets, sigs){
+function renderMarkets(short,all,sigs){
   const c=document.getElementById('mkts');
-  if(!markets.length){c.innerHTML='<div class="empty">Buscando mercados reais...<br><small>gamma-api.polymarket.com</small></div>';return;}
+  const markets=activeTab==='short'?short:all;
+  if(!markets.length){
+    c.innerHTML=`<div class="empty">${activeTab==='short'?'Nenhum mercado short-term (3–120min)<br><small>Mercados de curto prazo aparecem aqui</small>':'Buscando mercados...'}</div>`;
+    return;
+  }
   const sorted=[...markets].sort((a,b)=>a.mins_left-b.mins_left);
   maxVol=Math.max(...markets.map(m=>m.volume||1),1);
   let h=`<div class="mhdr"><div>Mercado</div><div style="text-align:right">YES</div><div style="text-align:center">Sig</div><div style="text-align:right">Encerra</div></div>`;
@@ -612,12 +708,18 @@ function renderMarkets(markets, sigs){
     const dir=sig.direction||'SKIP';
     const dc=dir==='YES'?'c-yes':dir==='NO'?'c-no':'c-skip';
     const ml=m.mins_left??9999;
-    const tc=ml<60?'var(--red)':ml<1440?'var(--yel)':'var(--dim)';
+    const tc=ml<30?'var(--red)':ml<120?'var(--yel)':'var(--dim)';
     const vpct=Math.min(100,(m.volume||0)/maxVol*100);
+    const isShort=m.is_short||false;
     h+=`<div class="mrow">
       <div>
         <div class="mq">${m.question}</div>
-        <div class="msub"><span style="color:var(--acc);font-size:6.5px">${m.symbol}</span><span>$${fNum(m.volume)}</span><span style="color:var(--dim)">liq $${fNum(m.liquidity)}</span></div>
+        <div class="msub">
+          <span style="color:var(--acc);font-size:6.5px">${m.symbol}</span>
+          ${isShort?'<span class="short-badge">SHORT</span>':''}
+          <span>$${fNum(m.volume)}</span>
+          <span style="color:var(--dim)">liq $${fNum(m.liquidity)}</span>
+        </div>
         <div class="vbar"><div class="vfill" style="width:${vpct.toFixed(0)}%"></div></div>
       </div>
       <div class="mp" style="color:${pc}">${(p*100).toFixed(1)}%</div>
@@ -631,7 +733,8 @@ function renderMarkets(markets, sigs){
 function renderTrades(open,closed){
   const c=document.getElementById('trades');
   if(!open.length&&!closed.length){
-    c.innerHTML='<div class="empty">Simulador aguardando warm-up.<br>Trades aparecerão após 3 min.<br><small>Usa preços reais do Polymarket.</small></div>';return;
+    c.innerHTML='<div class="empty">Aguardando warm-up (3min).<br>Só opera mercados 3–120min.<br><small>Resolução via CLOB API quando disponível.</small></div>';
+    return;
   }
   const now=Date.now()/1e3;
   function row(t,isOpen){
@@ -643,30 +746,38 @@ function renderTrades(open,closed){
     const al=t.action==='BUY_YES'?'▲ YES':'▼ NO';
     const prog=isOpen?Math.min(100,(now-t.entry_ts)/(t.horizon_min*60)*100):100;
     const enc=t.end_date_iso?new Date(t.end_date_iso).toLocaleDateString('pt-BR',{month:'short',day:'numeric'}):'';
+    const resolveTag=!isOpen&&t.exit_reason==='EXPIRED'?
+      `<span class="tg tg-real">REAL CLOB</span>`:'';
+    const mtype=t.market_type||'price';
     return `<div class="tcard ${cls}">
       <div class="tt"><span class="tsym">${t.symbol}</span><span class="tpnl" style="color:${pc}">${isOpen?'~':''} ${ps}</span></div>
       <div class="tq">${t.question}</div>
       <div class="tmeta">
         <span class="tg ${ac}">${al}</span>
         <span class="tg ${isOpen?'tg-o':'tg-c'}">${isOpen?'OPEN':t.exit_reason||'CLOSED'}</span>
-        <span class="tg tg-k">$${t.amount_usdc.toFixed(2)}</span>
+        <span class="tg tg-k">gross $${(t.gross_usdc||t.amount_usdc).toFixed(2)}</span>
+        <span class="tg tg-fee">fee $${(t.fee_usdc||0).toFixed(4)}</span>
         <span class="tg tg-k">in ${(t.entry_price*100).toFixed(1)}%</span>
         ${isOpen&&t.current_price!=null?`<span class="tg tg-k">now ${(t.current_price*100).toFixed(1)}%</span>`:''}
         <span class="tg tg-k">edge ${(t.signal_edge*100).toFixed(1)}%</span>
+        <span class="tg ${mtype==='price'?'tg-o':'tg-sim'}">${mtype}</span>
+        ${resolveTag}
         ${enc?`<span class="tg tg-k">${enc}</span>`:''}
       </div>
       ${isOpen?`<div class="prog"><div class="progf" style="width:${prog.toFixed(0)}%"></div></div>`:''}
     </div>`;
   }
-  c.innerHTML = open.map(t=>row(t,true)).join('') + [...closed].reverse().slice(0,25).map(t=>row(t,false)).join('');
+  c.innerHTML=open.map(t=>row(t,true)).join('')+[...closed].reverse().slice(0,30).map(t=>row(t,false)).join('');
 }
 
 function renderLog(logs){
   const c=document.getElementById('log');
   c.innerHTML=[...logs].reverse().slice(0,100).map(e=>{
-    const cls=e.event==='TRADE_OPEN'?'lo':e.level==='win'?'lw':e.level==='loss'?'ll':
+    const cls=e.event==='TRADE_OPEN'?'lo':
+              e.level==='win'?'lw':e.level==='loss'?'ll':
               e.event?.includes('START')||e.event?.includes('RESET')?'ls':
-              e.event==='SKIP'?'lk':'lo2';
+              e.event==='SKIP'?'lk':
+              e.event==='RESOLVE_REAL'?'lr':'lo2';
     return `<div class="loge ${cls}"><span class="lts">${e.ts_str}</span><span class="lev">${e.event}</span><span style="color:var(--txt)">${e.message}</span></div>`;
   }).join('');
 }
@@ -708,15 +819,16 @@ function drawSpark(cv,prices){
 
 async function toggleSim(){await fetch('/api/sim/toggle',{method:'POST'});}
 async function resetSim(){if(!confirm('Resetar simulação?'))return;await fetch('/api/sim/reset',{method:'POST'});eq=[{ts:Date.now()/1e3,v:100}];}
-async function refreshMarkets(){set('n-mkts','...','var(--yel)');await fetch('/api/refresh',{method:'POST'});}
+async function refreshMarkets(){set('cnt-short','...','var(--yel)');await fetch('/api/refresh',{method:'POST'});}
 </script>
 </body>
 </html>"""
 
 
 if __name__ == "__main__":
-    print("=" * 52)
-    print("  Polymarket Paper Bot — Mercados Reais")
-    print("  Abrindo → http://localhost:5001")
-    print("=" * 52)
+    print("=" * 60)
+    print("  Polymarket Paper Bot v3 — Short-Term Focus")
+    print(f"  Foco: mercados 3–120 minutos")
+    print("  Dashboard → http://localhost:5001")
+    print("=" * 60)
     app.run(debug=False, port=5001, threaded=True)

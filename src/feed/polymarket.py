@@ -1,10 +1,11 @@
 """
-src/feed/polymarket.py
-Feeds 100% reais do Polymarket:
-  - Gamma API: busca mercados cripto ativos (sem auth)
-  - CLOB REST:  preço midpoint + order book por token_id (sem auth para leitura)
-  - CLOB WS:   updates de preço em tempo real por asset_id (sem auth para leitura)
-  - Binance WS: preço spot BTC/ETH/SOL em tempo real
+src/feed/polymarket.py  v2
+Correções:
+- BinanceFeed: fix detecção de símbolo (aggTrade stream case-insensitive)
+- msg_count duplicado removido do ClobFeed
+- fetch_gamma_markets: filtro SHORT_TERM (3-120 min) separado
+- enrich_prices: agora em background thread (não bloqueia startup)
+- CLOB resolve: função nova para buscar resolução real de mercados
 """
 from __future__ import annotations
 import asyncio
@@ -18,47 +19,56 @@ from typing import Callable
 
 import requests
 
+from src.config import SHORT_TERM_MAX_MINUTES, SHORT_TERM_MIN_MINUTES
+
 # ── URLs ───────────────────────────────────────────────────────────────────────
-GAMMA_URL   = "https://gamma-api.polymarket.com/markets"
-CLOB_URL    = "https://clob.polymarket.com"
-CLOB_WS     = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-BIN_WS      = "wss://stream.binance.com:9443/stream"
+GAMMA_URL  = "https://gamma-api.polymarket.com/markets"
+CLOB_URL   = "https://clob.polymarket.com"
+CLOB_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BIN_WS     = "wss://stream.binance.com:9443/stream"
 
-SYMBOL_STREAMS = {
-    "BTC":  "btcusdt@aggTrade",
-    "ETH":  "ethusdt@aggTrade",
-    "SOL":  "solusdt@aggTrade",
-    "BNB":  "bnbusdt@aggTrade",
-    "MATIC":"maticusdt@aggTrade",
-    "DOGE": "dogeusdt@aggTrade",
+# FIX: mapa completo em lowercase para match com data["s"].lower()
+SYMBOL_STREAMS: dict[str, str] = {
+    "BTC":   "btcusdt",
+    "ETH":   "ethusdt",
+    "SOL":   "solusdt",
+    "BNB":   "bnbusdt",
+    "MATIC": "maticusdt",
+    "DOGE":  "dogeusdt",
+}
+# Inverso: "btcusdt" → "BTC"  (usado no handler do Binance)
+STREAM_TO_SYM: dict[str, str] = {v: k for k, v in SYMBOL_STREAMS.items()}
+
+CRYPTO_KEYWORDS: dict[str, list[str]] = {
+    "BTC":   ["bitcoin", "btc"],
+    "ETH":   ["ethereum", "eth"],
+    "SOL":   ["solana", "sol"],
+    "BNB":   ["bnb", "binance coin"],
+    "MATIC": ["matic", "polygon"],
+    "DOGE":  ["dogecoin", "doge"],
+    "XRP":   ["ripple", "xrp"],
 }
 
-CRYPTO_KEYWORDS = {
-    "BTC":   ["bitcoin","btc"],
-    "ETH":   ["ethereum","eth"],
-    "SOL":   ["solana","sol"],
-    "BNB":   ["bnb","binance coin"],
-    "MATIC": ["matic","polygon"],
-    "DOGE":  ["dogecoin","doge"],
-    "XRP":   ["ripple","xrp"],
-}
+POLYMARKET_FEE = 0.01   # 1% taxa maker/taker
 
-# ── Dataclass ─────────────────────────────────────────────────────────────────
+
+# ── Dataclass ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class PolyMarket:
-    token_id:     str         # YES token id (usado no CLOB)
-    no_token_id:  str         # NO  token id
-    question:     str
-    slug:         str
-    symbol:       str         # BTC | ETH | SOL | ...
-    end_date_iso: str         # "2025-03-15T20:00:00Z"
-    yes_price:    float       # 0–1
-    no_price:     float
-    volume:       float
-    liquidity:    float
-    image:        str = ""
-    description:  str = ""
+    token_id:      str
+    no_token_id:   str
+    condition_id:  str           # para buscar resolução real
+    question:      str
+    slug:          str
+    symbol:        str
+    end_date_iso:  str
+    yes_price:     float
+    no_price:      float
+    volume:        float
+    liquidity:     float
+    image:         str = ""
+    description:   str = ""
 
     def mins_left(self) -> float:
         try:
@@ -68,16 +78,22 @@ class PolyMarket:
         except Exception:
             return 9999.0
 
+    def is_short_term(self) -> bool:
+        ml = self.mins_left()
+        return SHORT_TERM_MIN_MINUTES <= ml <= SHORT_TERM_MAX_MINUTES
+
     def to_dict(self) -> dict:
         ml = self.mins_left()
         return {
             "token_id":     self.token_id,
             "no_token_id":  self.no_token_id,
+            "condition_id": self.condition_id,
             "question":     self.question,
             "slug":         self.slug,
             "symbol":       self.symbol,
             "end_date_iso": self.end_date_iso,
             "mins_left":    round(ml, 1),
+            "is_short":     self.is_short_term(),
             "yes_price":    round(self.yes_price, 4),
             "no_price":     round(self.no_price, 4),
             "volume":       round(self.volume, 2),
@@ -86,7 +102,7 @@ class PolyMarket:
         }
 
 
-# ── Gamma API ─────────────────────────────────────────────────────────────────
+# ── Gamma API ──────────────────────────────────────────────────────────────────
 
 def _detect_symbol(question: str) -> str | None:
     q = question.lower()
@@ -101,18 +117,18 @@ def fetch_gamma_markets(
     min_liquidity: float = 50.0,
     max_days: float = 90.0,
 ) -> list[PolyMarket]:
-    """
-    Busca mercados cripto ativos via Gamma API.
-    Retorna lista ordenada por volume decrescente.
-    """
+    """Busca mercados cripto ativos. Retorna lista ordenada por volume."""
     try:
         r = requests.get(
             GAMMA_URL,
-            params={"active":"true","closed":"false","limit":limit,"order":"volumeNum","ascending":"false"},
+            params={
+                "active": "true", "closed": "false",
+                "limit": limit, "order": "volumeNum", "ascending": "false",
+            },
             timeout=15,
         )
         r.raise_for_status()
-        raw = r.json()
+        raw   = r.json()
         items = raw if isinstance(raw, list) else raw.get("data", [])
     except Exception as e:
         print(f"[Gamma] Fetch error: {e}")
@@ -120,39 +136,34 @@ def fetch_gamma_markets(
 
     result: list[PolyMarket] = []
     for m in items:
-        q   = m.get("question","")
+        q   = m.get("question", "")
         sym = _detect_symbol(q)
         if not sym:
             continue
 
-        # clobTokenIds vem como JSON string
         try:
-            tids = json.loads(m.get("clobTokenIds","[]"))
+            tids = json.loads(m.get("clobTokenIds", "[]"))
             if len(tids) < 2:
                 continue
         except Exception:
             continue
 
-        # outcomePrices também é JSON string
         try:
-            prices = json.loads(m.get("outcomePrices","[0.5,0.5]"))
+            prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
             yes_p  = float(prices[0])
-            no_p   = float(prices[1]) if len(prices)>1 else 1-yes_p
+            no_p   = float(prices[1]) if len(prices) > 1 else 1 - yes_p
         except Exception:
             yes_p, no_p = 0.5, 0.5
 
-        # Data de fim
-        end_iso = m.get("endDateIso") or m.get("endDate","")
-        # endDateIso pode ser só "2025-03-15" sem horário
+        end_iso = m.get("endDateIso") or m.get("endDate", "")
         if end_iso and "T" not in end_iso:
-            end_iso = end_iso + "T23:59:00Z"
+            end_iso += "T23:59:00Z"
 
-        # Filtro: não encerrado, liquidez mínima, horizonte máximo
         try:
             from datetime import datetime, timezone
-            end_dt    = datetime.fromisoformat(end_iso.replace("Z","+00:00"))
-            mins_left = (end_dt - datetime.now(timezone.utc)).total_seconds()/60
-            if mins_left < 0 or mins_left > max_days*1440:
+            end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            mins_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 60
+            if mins_left < 0 or mins_left > max_days * 1440:
                 continue
         except Exception:
             pass
@@ -161,33 +172,45 @@ def fetch_gamma_markets(
         if liq < min_liquidity:
             continue
 
-        vol = float(m.get("volumeNum") or m.get("volume") or 0)
+        vol          = float(m.get("volumeNum") or m.get("volume") or 0)
+        condition_id = m.get("conditionId") or m.get("condition_id") or ""
 
         result.append(PolyMarket(
-            token_id    = tids[0],
-            no_token_id = tids[1],
-            question    = q,
-            slug        = m.get("slug",""),
-            symbol      = sym,
-            end_date_iso= end_iso,
-            yes_price   = yes_p,
-            no_price    = no_p,
-            volume      = vol,
-            liquidity   = liq,
-            image       = m.get("image","") or m.get("icon","") or "",
-            description = m.get("description","")[:200] if m.get("description") else "",
+            token_id     = tids[0],
+            no_token_id  = tids[1],
+            condition_id = condition_id,
+            question     = q,
+            slug         = m.get("slug", ""),
+            symbol       = sym,
+            end_date_iso = end_iso,
+            yes_price    = yes_p,
+            no_price     = no_p,
+            volume       = vol,
+            liquidity    = liq,
+            image        = m.get("image", "") or m.get("icon", "") or "",
+            description  = (m.get("description", "") or "")[:200],
         ))
 
     print(f"[Gamma] {len(items)} total → {len(result)} crypto markets")
     return result
 
 
-# ── CLOB REST ─────────────────────────────────────────────────────────────────
+def fetch_short_term_markets(min_liquidity: float = 100.0) -> list[PolyMarket]:
+    """
+    Busca APENAS mercados de curto prazo (3–120 min).
+    Liquidez mínima maior para garantir spreads decentes.
+    """
+    all_markets  = fetch_gamma_markets(limit=500, min_liquidity=min_liquidity, max_days=1)
+    short        = [m for m in all_markets if m.is_short_term()]
+    print(f"[Gamma] Short-term ({SHORT_TERM_MIN_MINUTES}-{SHORT_TERM_MAX_MINUTES}min): {len(short)} mercados")
+    return short
+
+
+# ── CLOB REST ──────────────────────────────────────────────────────────────────
 
 def clob_midpoint(token_id: str) -> float | None:
-    """Preço midpoint via CLOB REST. Sem auth."""
     try:
-        r = requests.get(f"{CLOB_URL}/midpoint", params={"token_id":token_id}, timeout=5)
+        r = requests.get(f"{CLOB_URL}/midpoint", params={"token_id": token_id}, timeout=5)
         if r.status_code == 200:
             mid = r.json().get("mid")
             if mid is not None:
@@ -198,63 +221,92 @@ def clob_midpoint(token_id: str) -> float | None:
 
 
 def clob_book(token_id: str) -> dict | None:
-    """Melhor bid/ask via CLOB REST. Sem auth."""
     try:
-        r = requests.get(f"{CLOB_URL}/book", params={"token_id":token_id}, timeout=5)
+        r = requests.get(f"{CLOB_URL}/book", params={"token_id": token_id}, timeout=5)
         if r.status_code == 200:
             d    = r.json()
-            bids = d.get("bids",[])
-            asks = d.get("asks",[])
+            bids = d.get("bids", [])
+            asks = d.get("asks", [])
             bid  = max((float(b["price"]) for b in bids), default=0.0) if bids else 0.0
             ask  = min((float(a["price"]) for a in asks), default=1.0) if asks else 1.0
-            return {"bid":bid,"ask":ask,"mid":(bid+ask)/2,"spread":ask-bid}
+            return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2, "spread": ask - bid}
     except Exception:
         pass
     return None
 
 
-def enrich_prices(markets: list[PolyMarket]) -> None:
-    """Atualiza yes_price/no_price dos mercados via CLOB REST (em batch)."""
-    for m in markets[:30]:   # só os 30 mais relevantes para não sobrecarregar
-        mid = clob_midpoint(m.token_id)
-        if mid is not None:
-            m.yes_price = mid
-            m.no_price  = 1 - mid
-        time.sleep(0.05)      # 50ms entre chamadas — gentil com a API
+def fetch_market_resolution(condition_id: str) -> bool | None:
+    """
+    Busca se um mercado já resolveu e qual foi o resultado (YES=True / NO=False).
+    Retorna None se ainda não resolveu ou não encontrou.
+    
+    Usa o endpoint /markets do CLOB filtrado por condition_id.
+    """
+    if not condition_id:
+        return None
+    try:
+        r = requests.get(
+            f"{CLOB_URL}/markets/{condition_id}",
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        # Campo "resolved" + "outcome" no CLOB response
+        if data.get("resolved") or data.get("closed"):
+            outcome = data.get("outcome", "")
+            if isinstance(outcome, str):
+                return outcome.upper() in ("YES", "1", "TRUE", "WIN")
+            if isinstance(outcome, (int, float)):
+                return float(outcome) > 0.5
+        return None
+    except Exception:
+        return None
 
 
-# ── CLOB WebSocket ────────────────────────────────────────────────────────────
+def enrich_prices_background(markets: list[PolyMarket]) -> None:
+    """
+    Atualiza yes_price dos mercados via CLOB REST em background thread.
+    NÃO bloqueia o startup do servidor.
+    """
+    def _worker():
+        for m in markets[:30]:
+            try:
+                mid = clob_midpoint(m.token_id)
+                if mid is not None:
+                    m.yes_price = mid
+                    m.no_price  = 1 - mid
+                time.sleep(0.05)
+            except Exception:
+                pass
+        print("[CLOB] Preços enriquecidos em background")
+
+    threading.Thread(target=_worker, daemon=True, name="EnrichPrices").start()
+
+
+# ── CLOB WebSocket ─────────────────────────────────────────────────────────────
 
 class ClobFeed:
     """
-    WebSocket CLOB do Polymarket.
-    Recebe book events (bids/asks) e last_trade_price para os token_ids inscritos.
-    Sem autenticação para leitura pública de mercado.
-
-    Formato de subscrição:
-      {"auth": {}, "markets": [], "assets_ids": [...], "type": "market"}
-
-    Mensagens recebidas (type="book"):
-      {"asset_id":"...", "bids":[{"price":"0.45","size":"100"},...], "asks":[...], "timestamp":"..."}
-    Mensagens recebidas (type="last_trade_price"):
-      {"asset_id":"...", "price":"0.47", "size":"50", "side":"BUY", "timestamp":"..."}
+    WebSocket CLOB do Polymarket — updates de preço em tempo real.
+    FIX v2: msg_count não duplicado; subscriptions em batch de 50.
     """
 
     def __init__(
         self,
         token_ids: list[str],
-        on_update: Callable[[str, float, float], None],  # token_id, bid, ask
+        on_update: Callable[[str, float, float], None],
     ):
-        self.token_ids   = token_ids
-        self.on_update   = on_update
-        self._running    = False
-        self._thread:    threading.Thread | None = None
-        self._loop:      asyncio.AbstractEventLoop | None = None
-        self.connected   = False
-        self.msg_count   = 0
-        self.last_ts     = 0.0
-        self.latencies:  list[float] = []
-        self._book:      dict[str, dict] = {}  # token_id → {bid, ask}
+        self.token_ids = token_ids
+        self.on_update = on_update
+        self._running  = False
+        self._thread:  threading.Thread | None = None
+        self._loop:    asyncio.AbstractEventLoop | None = None
+        self.connected = False
+        self.msg_count = 0          # FIX: incrementado apenas 1x por mensagem
+        self.last_ts   = 0.0
+        self.latencies: list[float] = []
+        self._book:    dict[str, dict] = {}
 
     def start(self):
         self._running = True
@@ -266,7 +318,7 @@ class ClobFeed:
 
     def avg_latency_ms(self) -> float:
         s = self.latencies[-100:]
-        return sum(s)/len(s) if s else 0.0
+        return sum(s) / len(s) if s else 0.0
 
     def _run(self):
         self._loop = asyncio.new_event_loop()
@@ -278,21 +330,14 @@ class ClobFeed:
             try:
                 import websockets
                 async with websockets.connect(
-                    CLOB_WS,
-                    ping_interval=20,
-                    ping_timeout=15,
-                    open_timeout=10,
+                    CLOB_WS, ping_interval=20, ping_timeout=15, open_timeout=10,
                 ) as ws:
-                    # Subscreve em batches de 50
                     for i in range(0, len(self.token_ids), 50):
-                        batch = self.token_ids[i:i+50]
+                        batch = self.token_ids[i:i + 50]
                         await ws.send(json.dumps({
-                            "auth":      {},
-                            "markets":   [],
-                            "assets_ids":batch,
-                            "type":      "market",
+                            "auth": {}, "markets": [],
+                            "assets_ids": batch, "type": "market",
                         }))
-
                     self.connected = True
                     print(f"[ClobWS] Connected — {len(self.token_ids)} tokens")
 
@@ -304,7 +349,6 @@ class ClobFeed:
                             self._handle(raw, recv_ts)
                         except Exception:
                             pass
-
             except Exception as e:
                 self.connected = False
                 print(f"[ClobWS] {e} — retry 5s")
@@ -316,65 +360,54 @@ class ClobFeed:
             msgs = [msgs]
 
         for msg in msgs:
-            asset_id = msg.get("asset_id","")
+            asset_id = msg.get("asset_id", "")
             if not asset_id or asset_id not in self.token_ids:
                 continue
 
-            mtype = msg.get("event_type") or msg.get("type","")
+            mtype = msg.get("event_type") or msg.get("type", "")
             bid = ask = None
 
             if mtype == "book":
-                # Snapshot completo de bids/asks
-                bids = msg.get("bids",[])
-                asks = msg.get("asks",[])
+                bids = msg.get("bids", [])
+                asks = msg.get("asks", [])
                 if bids:
                     bid = max(float(b["price"]) for b in bids)
                 if asks:
                     ask = min(float(a["price"]) for a in asks)
-
-            elif mtype == "price_change":
-                # Delta update: price field é o novo midpoint
+            elif mtype in ("price_change", "last_trade_price"):
                 p   = float(msg.get("price", 0))
                 bid = p - 0.005
                 ask = p + 0.005
-
-            elif mtype == "last_trade_price":
-                p   = float(msg.get("price", 0))
-                bid = p - 0.003
-                ask = p + 0.003
-
             else:
-                # Tenta extrair qualquer campo de preço
                 if "bids" in msg and "asks" in msg:
                     bids = msg["bids"]
                     asks = msg["asks"]
-                    if bids: bid = max(float(b["price"]) for b in bids)
-                    if asks: ask = min(float(a["price"]) for a in asks)
+                    if bids:
+                        bid = max(float(b["price"]) for b in bids)
+                    if asks:
+                        ask = min(float(a["price"]) for a in asks)
 
-            if bid is None or ask is None:
-                # Usa estado anterior + delta
-                prev = self._book.get(asset_id)
-                if prev and bid is None: bid = prev["bid"]
-                if prev and ask is None: ask = prev["ask"]
-
+            prev = self._book.get(asset_id, {})
+            if bid is None:
+                bid = prev.get("bid")
+            if ask is None:
+                ask = prev.get("ask")
             if bid is None or ask is None:
                 continue
 
             bid = max(0.01, min(0.99, bid))
             ask = max(0.01, min(0.99, ask))
 
-            self._book[asset_id] = {"bid":bid,"ask":ask}
-            self.msg_count += 1
+            self._book[asset_id] = {"bid": bid, "ask": ask}
+            self.msg_count += 1      # FIX: incremento único
             self.last_ts    = recv_ts
-            self.msg_count  += 1
 
-            # Latência
             ts_raw = msg.get("timestamp") or msg.get("ts")
             if ts_raw:
                 try:
-                    s = float(ts_raw)
-                    sent = s/1000 if s > 1e10 else s
-                    lat  = (recv_ts - sent)*1000
+                    s    = float(ts_raw)
+                    sent = s / 1000 if s > 1e10 else s
+                    lat  = (recv_ts - sent) * 1000
                     if 0 < lat < 5000:
                         self.latencies.append(lat)
                         if len(self.latencies) > 200:
@@ -385,10 +418,13 @@ class ClobFeed:
             self.on_update(asset_id, bid, ask)
 
 
-# ── Binance WebSocket ─────────────────────────────────────────────────────────
+# ── Binance WebSocket ──────────────────────────────────────────────────────────
 
 class BinanceFeed:
-    """aggTrade stream do Binance — preço spot em tempo real."""
+    """
+    aggTrade stream do Binance.
+    FIX v2: detecção de símbolo corrigida (case-insensitive, sem @aggTrade).
+    """
 
     def __init__(self, symbols: list[str], on_tick: Callable[[str, float, float], None]):
         self.symbols   = [s for s in symbols if s in SYMBOL_STREAMS]
@@ -413,7 +449,9 @@ class BinanceFeed:
         loop.run_until_complete(self._stream())
 
     async def _stream(self):
-        streams = "/".join(SYMBOL_STREAMS[s] for s in self.symbols)
+        streams = "/".join(
+            f"{SYMBOL_STREAMS[s]}@aggTrade" for s in self.symbols
+        )
         url = f"{BIN_WS}?streams={streams}"
         while self._running:
             try:
@@ -424,11 +462,12 @@ class BinanceFeed:
                     async for raw in ws:
                         if not self._running:
                             break
-                        data = json.loads(raw).get("data",{})
+                        data = json.loads(raw).get("data", {})
                         if data.get("e") == "aggTrade":
-                            stream = data["s"].lower()  # "btcusdt"
-                            sym = next((k for k,v in SYMBOL_STREAMS.items() if v.startswith(stream.replace("@aggtrade",""))),None)
-                            if sym:
+                            # FIX: data["s"] = "BTCUSDT" → lowercase → "btcusdt" → lookup
+                            bin_sym = data["s"].lower()  # "btcusdt"
+                            sym = STREAM_TO_SYM.get(bin_sym)
+                            if sym and sym in self.symbols:
                                 p = float(data["p"])
                                 q = float(data["q"])
                                 self.last_prices[sym] = p
@@ -440,10 +479,12 @@ class BinanceFeed:
                 await asyncio.sleep(3)
 
 
+# ── Mock Binance ───────────────────────────────────────────────────────────────
+
 class MockBinanceFeed:
-    """Mock Binance — random walk baseado em preços reais como seed."""
-    BASE = {"BTC":83000.,"ETH":3200.,"SOL":145.,"BNB":580.,"MATIC":0.85,"DOGE":0.13}
-    VOL  = {"BTC":0.0005,"ETH":0.0009,"SOL":0.0014,"BNB":0.0008,"MATIC":0.002,"DOGE":0.002}
+    """Mock Binance — random walk com preços realistas."""
+    BASE = {"BTC": 83000., "ETH": 3200., "SOL": 145., "BNB": 580., "MATIC": 0.85, "DOGE": 0.13}
+    VOL  = {"BTC": 0.0005, "ETH": 0.0009, "SOL": 0.0014, "BNB": 0.0008, "MATIC": 0.002, "DOGE": 0.002}
 
     def __init__(self, symbols: list[str], on_tick: Callable[[str, float, float], None]):
         self.symbols    = symbols
@@ -464,7 +505,7 @@ class MockBinanceFeed:
             while self._running:
                 for s in self.symbols:
                     v = self.VOL.get(s, 0.001)
-                    self._prices[s] *= 1 + random.gauss(0, v) + math.sin(t/180)*v*0.2
+                    self._prices[s] *= 1 + random.gauss(0, v) + math.sin(t / 180) * v * 0.2
                     p = self._prices[s]
                     self.last_prices[s] = p
                     self.tick_count += 1
@@ -479,11 +520,12 @@ class MockBinanceFeed:
         self._running = False
 
 
+# ── Mock CLOB ─────────────────────────────────────────────────────────────────
+
 class MockClobFeed:
     """
-    Mock CLOB — usa os mercados REAIS buscados da Gamma API,
-    mas simula o movimento de preço.
-    O preço de cada mercado é influenciado pelo preço spot Binance.
+    Mock CLOB — usa mercados REAIS da Gamma API, simula movimento de preço.
+    Influenciado pelo spot Binance para mercados de preço.
     """
 
     def __init__(
@@ -500,8 +542,7 @@ class MockClobFeed:
         self.msg_count     = 0
         self.last_ts       = 0.0
         self.latencies:    list[float] = []
-        # Seed: usa preços reais da Gamma como ponto de partida
-        self._probs: dict[str, float] = {m.token_id: m.yes_price for m in markets}
+        self._probs: dict[str, float]  = {m.token_id: m.yes_price for m in markets}
 
     def start(self):
         self._running  = True
@@ -514,31 +555,32 @@ class MockClobFeed:
 
     def avg_latency_ms(self) -> float:
         s = self.latencies[-50:]
-        return sum(s)/len(s) if s else 0.0
+        return sum(s) / len(s) if s else 0.0
 
     def _loop(self):
         t = 0
         while self._running:
-            for m in self.markets:
-                # Influência spot (mercados de preço BTC/ETH/SOL)
+            # Só processa mercados ainda válidos (não expirados)
+            active = [m for m in self.markets if m.mins_left() > 0.5]
+            for m in active:
                 influence = 0.0
                 buf = self.price_buffers.get(m.symbol)
                 if buf:
                     p_now = buf.latest_price()
                     p_ago = buf.price_n_seconds_ago(60)
                     if p_now and p_ago and p_ago != 0:
-                        pct = (p_now/p_ago - 1)*100
-                        influence = pct * 0.08  # 8% de transmissão do spot para o mercado
+                        pct       = (p_now / p_ago - 1) * 100
+                        influence = pct * 0.08
 
                 noise = random.gauss(0, 0.004)
-                drift = math.sin(t/100 + hash(m.slug[:8])%30) * 0.001
-                new_p = self._probs[m.token_id] + influence*0.1 + drift + noise
+                drift = math.sin(t / 100 + hash(m.slug[:8]) % 30) * 0.001
+                new_p = self._probs.get(m.token_id, m.yes_price) + influence * 0.1 + drift + noise
                 new_p = max(0.02, min(0.98, new_p))
                 self._probs[m.token_id] = new_p
 
                 spread = random.uniform(0.01, 0.03)
-                bid    = max(0.01, new_p - spread/2)
-                ask    = min(0.99, new_p + spread/2)
+                bid    = max(0.01, new_p - spread / 2)
+                ask    = min(0.99, new_p + spread / 2)
 
                 self.msg_count += 1
                 self.last_ts    = time.time()
