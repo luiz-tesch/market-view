@@ -21,6 +21,7 @@ from typing import Literal
 PRICE_KEYWORDS = [
     "above", "below", "over", "under", "reach", "hit", "exceed",
     "higher than", "lower than", "at least", "at most", "more than", "less than",
+    "up or down"
 ]
 EVENT_KEYWORDS = [
     "approve", "ban", "launch", "release", "win", "lose",
