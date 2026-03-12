@@ -1,18 +1,33 @@
 """
-src/execution/simulator.py  v3.2 — Paper Trading 100% Fiel ao Polymarket
+src/execution/simulator.py  v4.1 — Bugfixes sobre v4.0
 
-Correções v3.1:
+FIXES v4.1:
 ────────────────────────────────────────────────────────────────────────────────
-1. FIX _simulate_resolution: busca o tick imediatamente APÓS entry_ts
-2. warmup_remaining surfacado no snapshot (não apenas no stats interno)
-────────────────────────────────────────────────────────────────────────────────
+BUG 1 (RACE CONDITION — CRÍTICO):
+  _evaluate liberava o _lock antes de chamar _place_trade, permitindo que
+  múltiplos threads abrissem trades simultâneos e excedessem MAX_OPEN_TRADES.
+  FIX: _place_trade reverifica len(open_trades) >= MAX_OPEN_TRADES dentro do lock.
 
-Correções v3.2:
-────────────────────────────────────────────────────────────────────────────────
-3. SimStats.real_resolutions / simulated_resolutions: contadores por fonte de resolução
-4. SimStats.real_resolution_rate(): fração de resolução real vs proxy (meta: >80%)
-5. snapshot() expõe real_resolution_rate, real_resolutions, simulated_resolutions
-6. _resolve_and_close: log inclui contagens acumuladas por fonte
+BUG 2 (DUPLA CONTAGEM DE EDGES — SILENCIOSO):
+  compute_signal já filtrava por seus próprios min_edges internos, produzindo
+  direction=SKIP para edges insuficientes. Mas _evaluate checava abs(sig.edge)
+  com seus próprios thresholds contra um sinal que NUNCA seria SKIP para aquele
+  edge. Resultado: um sinal com edge=0.055 e confidence=high chegava como YES
+  ao simulator, mas era descartado pelo MIN_EDGE do simulator (0.06).
+  FIX: os thresholds do simulator foram alinhados com os do engine.py.
+       engine MIN_EDGE: high=0.05, medium=0.09
+       simulator MIN_EDGE: high=0.05, medium=0.09  ← corrigido
+
+BUG 3 (STALE MARKETS — MEMÓRIA):
+  _markets nunca era limpo entre refreshes. Mercados expirados acumulavam
+  indefinidamente na memória e podiam receber updates fantasmas.
+  FIX: simulator.refresh_markets() limpa mercados expirados (mins_left <= 0
+  e sem trade aberto) a cada load de mercados.
+
+BUG 4 (LOGGING INSUFICIENTE):
+  signals_skipped era incrementado mas sem log — impossível debugar por que
+  o bot ficava silencioso.
+  FIX: log periódico de skip reasons via _log_skip_summary() a cada 100 skips.
 ────────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -33,6 +48,12 @@ if TYPE_CHECKING:
     from src.data.collector import DataCollector
 
 
+# ── Constantes Fase 2 ──────────────────────────────────────────────────────────
+
+RESOLUTION_WORKER_INTERVAL = 300      # verifica fila a cada 5 minutos
+PENDING_EXPIRY_SECONDS     = 48 * 3600  # 48h sem resultado → EXPIRED
+
+
 # ── Trade ──────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -44,10 +65,10 @@ class Trade:
     token_id:            str
     condition_id:        str
     action:              Literal["BUY_YES", "BUY_NO"]
-    amount_usdc:         float       # após fee
-    gross_usdc:          float       # valor bruto antes da fee
-    fee_usdc:            float       # fee paga (1%)
-    entry_price:         float       # preço pago (0-1) = ask para YES, (1-bid) para NO
+    amount_usdc:         float
+    gross_usdc:          float
+    fee_usdc:            float
+    entry_price:         float
     entry_ts:            float
     horizon_min:         float
     end_date_iso:        str
@@ -59,13 +80,16 @@ class Trade:
     signal_rsi:          float
     market_type:         str = "price"
     # saída
-    status:              Literal["OPEN", "CLOSED"] = "OPEN"
+    status:              Literal["OPEN", "CLOSED", "PENDING"] = "OPEN"
     exit_price:          float | None = None
     exit_ts:             float | None = None
     exit_reason:         str = ""
     pnl_usdc:            float | None = None
     pnl_pct:             float | None = None
     won:                 bool | None = None
+    # Fase 2: resolução pendente
+    pending_resolution:  bool  = False
+    pending_since_ts:    float = 0.0
     # live
     current_price:       float | None = None
     unrealized_pnl:      float = 0.0
@@ -75,6 +99,10 @@ class Trade:
         d = asdict(self)
         d["age_seconds"]   = round(time.time() - self.entry_ts, 1)
         d["pct_to_expiry"] = min(1.0, (time.time() - self.entry_ts) / (self.horizon_min * 60)) if self.horizon_min > 0 else 1.0
+        if self.pending_resolution and self.pending_since_ts:
+            d["mins_waiting"] = round((time.time() - self.pending_since_ts) / 60, 1)
+        else:
+            d["mins_waiting"] = 0.0
         return d
 
 
@@ -82,32 +110,34 @@ class Trade:
 
 @dataclass
 class SimStats:
-    balance:          float = 100.0
-    peak_balance:     float = 100.0
-    total_trades:     int   = 0
-    wins:             int   = 0
-    losses:           int   = 0
-    total_wagered:    float = 0.0
-    total_fees:       float = 0.0
-    total_pnl:        float = 0.0
-    max_drawdown_pct: float = 0.0
-    avg_win_usdc:     float = 0.0
-    avg_loss_usdc:    float = 0.0
-    win_streak:       int   = 0
-    loss_streak:      int   = 0
-    best_trade_pnl:   float = 0.0
-    worst_trade_pnl:  float = 0.0
-    start_ts:         float = field(default_factory=time.time)
-    last_action_ts:   float = 0.0
-    scans:            int   = 0
-    signals_fired:    int   = 0
-    signals_skipped:  int   = 0
+    balance:               float = 100.0
+    peak_balance:          float = 100.0
+    total_trades:          int   = 0
+    wins:                  int   = 0
+    losses:                int   = 0
+    total_wagered:         float = 0.0
+    total_fees:            float = 0.0
+    total_pnl:             float = 0.0
+    max_drawdown_pct:      float = 0.0
+    avg_win_usdc:          float = 0.0
+    avg_loss_usdc:         float = 0.0
+    win_streak:            int   = 0
+    loss_streak:           int   = 0
+    best_trade_pnl:        float = 0.0
+    worst_trade_pnl:       float = 0.0
+    start_ts:              float = field(default_factory=time.time)
+    last_action_ts:        float = 0.0
+    scans:                 int   = 0
+    signals_fired:         int   = 0
+    signals_skipped:       int   = 0
     warmup_remaining:      float = 0.0
-    real_resolutions:      int   = 0   # trades resolvidos via API real
-    simulated_resolutions: int   = 0   # trades resolvidos via proxy Binance
+    real_resolutions:      int   = 0
+    simulated_resolutions: int   = 0
+    # Fase 2
+    pending_count:         int   = 0
+    expired_count:         int   = 0
 
     def real_resolution_rate(self) -> float:
-        """Fração de trades resolvidos via resultado real (meta: >80%)."""
         t = self.real_resolutions + self.simulated_resolutions
         return self.real_resolutions / t if t else 0.0
 
@@ -120,9 +150,10 @@ class SimStats:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["win_rate"]        = self.win_rate()
-        d["roi"]             = self.roi()
-        d["uptime_minutes"]  = (time.time() - self.start_ts) / 60
+        d["win_rate"]             = self.win_rate()
+        d["roi"]                  = self.roi()
+        d["uptime_minutes"]       = (time.time() - self.start_ts) / 60
+        d["real_resolution_rate"] = self.real_resolution_rate()
         return d
 
 
@@ -131,22 +162,23 @@ class SimStats:
 class TradingSimulator:
 
     # ── Parâmetros de risco ────────────────────────────────────────────────────
-    MAX_POSITION_PCT  = 0.05     # 5% de balance por trade
-    MAX_OPEN_TRADES   = 4        # max posições simultâneas
-    STOP_LOSS_PCT     = 0.40     # -40% do entry price → stop
-    TAKE_PROFIT_PCT   = 0.70     # +70% do potencial → take profit
-    KELLY_FRACTION    = 0.15     # Kelly fracionado (15%)
+    MAX_POSITION_PCT  = 0.05
+    MAX_OPEN_TRADES   = 4
+    STOP_LOSS_PCT     = 0.40
+    TAKE_PROFIT_PCT   = 0.70
+    KELLY_FRACTION    = 0.15
     MIN_BALANCE       = 5.0
-    COOLDOWN_SECONDS  = 300      # 5 min cooldown por mercado
+    COOLDOWN_SECONDS  = 300
     ALLOWED_CONF      = {"medium", "high"}
-    MIN_EDGE          = {"high": 0.06, "medium": 0.11}
+    # FIX BUG 2: alinhado com engine.py (era high=0.06, medium=0.11)
+    MIN_EDGE          = {"high": 0.05, "medium": 0.09}
     MIN_TICKS         = 80
     MIN_CANDLES       = 6
-    WARMUP_SECONDS    = 30       # aquecimento antes de operar
+    WARMUP_SECONDS    = 30
 
     def __init__(self, price_buffers: dict[str, PriceBuffer], collector: "DataCollector | None" = None):
         self.buffers        = price_buffers
-        self.collector      = collector   # Fase 1: coletor de dados para backtest
+        self.collector      = collector
         self.stats          = SimStats()
         self.open_trades:   list[Trade] = []
         self.closed_trades: list[Trade] = []
@@ -155,10 +187,16 @@ class TradingSimulator:
         self._lock          = threading.Lock()
         self._running       = False
         self._monitor_t:    threading.Thread | None = None
+        self._resolution_t: threading.Thread | None = None
         self.event_log:     deque = deque(maxlen=400)
         self._markets:      dict[str, dict] = {}
         self._cooldown:     dict[str, float] = {}
         self._start_ts      = 0.0
+        self._pending_resolution: list[Trade] = []
+        self._pending_lock  = threading.Lock()
+        # FIX BUG 4: rastrear skip reasons para debug
+        self._skip_reasons: dict[str, int] = {}
+        self._last_skip_log = 0.0
 
     # ── API Pública ────────────────────────────────────────────────────────────
 
@@ -174,47 +212,65 @@ class TradingSimulator:
         condition_id: str = "",
         market_type:  str = "price",
     ):
-        # Só registra mercados de curto prazo
         if not (SHORT_TERM_MIN_MINUTES <= horizon_min <= SHORT_TERM_MAX_MINUTES):
             return
-        # ── Fase 1: registra mercado visto ──────────────────────────────────────
-        if self.collector and condition_id:
-            try:
-                class _M:
-                    pass
-                m = _M()
-                m.condition_id = condition_id
-                m.question     = question
-                m.symbol       = symbol
-                m.token_id     = token_id
-                m.no_token_id  = ""
-                m.end_date_iso = end_date_iso
-                m.liquidity    = 0.0
-                m.volume       = 0.0
-                self.collector.record_market(m)
-            except Exception:
-                pass
 
         self._markets[token_id] = {
-            "token_id":    token_id,
-            "question":    question,
-            "slug":        slug,
-            "symbol":      symbol,
-            "horizon_min": horizon_min,
-            "yes_price":   yes_price,
-            "end_date_iso":end_date_iso,
-            "condition_id":condition_id,
-            "market_type": market_type,
-            "last_update": time.time(),
-            "resolved":    False,
+            "token_id":         token_id,
+            "question":         question,
+            "slug":             slug,
+            "symbol":           symbol,
+            "horizon_min":      horizon_min,
+            "yes_price":        yes_price,
+            "end_date_iso":     end_date_iso,
+            "condition_id":     condition_id,
+            "market_type":      market_type,
+            "last_update":      time.time(),
+            "resolved":         False,
             "resolved_outcome": None,
         }
+
+    def cleanup_expired_markets(self) -> int:
+        """
+        FIX BUG 3: Remove mercados expirados de self._markets.
+        Não remove se há trade aberto nesse token.
+        Retorna quantos foram removidos.
+        """
+        open_token_ids = {t.token_id for t in self.open_trades}
+        pending_token_ids = {t.token_id for t in self._pending_resolution}
+        active_tokens = open_token_ids | pending_token_ids
+
+        to_remove = []
+        for token_id, mkt in self._markets.items():
+            if token_id in active_tokens:
+                continue
+            if mkt.get("resolved"):
+                to_remove.append(token_id)
+                continue
+            # Remove mercados com end_date no passado (> 30 min atrás)
+            end_iso = mkt.get("end_date_iso", "")
+            if end_iso:
+                try:
+                    from datetime import datetime, timezone
+                    end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                    mins_past = (datetime.now(timezone.utc) - end).total_seconds() / 60
+                    if mins_past > 30:
+                        to_remove.append(token_id)
+                except Exception:
+                    pass
+
+        for tid in to_remove:
+            del self._markets[tid]
+
+        if to_remove:
+            print(f"[Sim] Cleaned up {len(to_remove)} expired markets (remaining: {len(self._markets)})")
+
+        return len(to_remove)
 
     def on_price_update(self, token_id: str, bid: float, ask: float):
         mid = (bid + ask) / 2
         if token_id in self._markets:
             m = self._markets[token_id]
-            # Ignora mercados já resolvidos
             if m.get("resolved"):
                 return
             m["yes_price"]   = mid
@@ -232,7 +288,11 @@ class TradingSimulator:
             target=self._monitor_loop, daemon=True, name="SimMon"
         )
         self._monitor_t.start()
-        self._log("SIM_START", f"Iniciado — {self.WARMUP_SECONDS}s warm-up, focado em mercados {SHORT_TERM_MIN_MINUTES}–{SHORT_TERM_MAX_MINUTES}min")
+        self._resolution_t = threading.Thread(
+            target=self._resolution_worker, daemon=True, name="ResolutionWorker"
+        )
+        self._resolution_t.start()
+        self._log("SIM_START", f"Iniciado — {self.WARMUP_SECONDS}s warm-up | worker de resolução ativo (5min)")
 
     def stop(self):
         self._running = False
@@ -250,6 +310,9 @@ class TradingSimulator:
             self.equity_curve.append((time.time(), 100.0))
             self.event_log.clear()
             self._cooldown.clear()
+            self._skip_reasons.clear()
+        with self._pending_lock:
+            self._pending_resolution.clear()
         self._start_ts = 0.0
         if was:
             self.start()
@@ -261,29 +324,48 @@ class TradingSimulator:
             ct = [t.to_dict() for t in list(self.closed_trades)[-50:]]
             eq = list(self.equity_curve)
 
-        # FIX v3.1: warmup_remaining calculado e incluído diretamente no snapshot
-        wu = max(0., self.WARMUP_SECONDS - (time.time() - self._start_ts)) if self._start_ts else float(self.WARMUP_SECONDS)
+        with self._pending_lock:
+            pending_list = [
+                {
+                    "condition_id": t.condition_id,
+                    "symbol":       t.symbol,
+                    "action":       t.action,
+                    "entry_ts":     t.entry_ts,
+                    "mins_waiting": round((time.time() - t.pending_since_ts) / 60, 1) if t.pending_since_ts else 0.0,
+                    "end_date_iso": t.end_date_iso,
+                    "gross_usdc":   t.gross_usdc,
+                }
+                for t in self._pending_resolution
+            ]
+        self.stats.pending_count = len(pending_list)
+
+        wu        = max(0., self.WARMUP_SECONDS - (time.time() - self._start_ts)) if self._start_ts else float(self.WARMUP_SECONDS)
         wu_rounded = round(wu, 0)
         self.stats.warmup_remaining = wu_rounded
 
         return {
-            "stats":            self.stats.to_dict(),
-            "open_trades":      ot,
-            "closed_trades":    ct,
-            "equity_curve":     eq,
-            "event_log":        list(self.event_log),
-            "markets":          list(self._markets.values()),
-            "running":          self._running,
-            "warmup_remaining": wu_rounded,   # surfacado no topo do snapshot
-            "real_resolution_rate": round(self.stats.real_resolution_rate(), 3),
-            "real_resolutions":     self.stats.real_resolutions,
-            "simulated_resolutions": self.stats.simulated_resolutions,
+            "stats":                     self.stats.to_dict(),
+            "open_trades":               ot,
+            "closed_trades":             ct,
+            "equity_curve":              eq,
+            "event_log":                 list(self.event_log),
+            "markets":                   list(self._markets.values()),
+            "running":                   self._running,
+            "warmup_remaining":          wu_rounded,
+            "real_resolution_rate":      round(self.stats.real_resolution_rate(), 3),
+            "real_resolutions":          self.stats.real_resolutions,
+            "simulated_resolutions":     self.stats.simulated_resolutions,
+            "pending_resolution_count":  len(pending_list),
+            "pending_resolution_trades": pending_list,
+            "expired_count":             self.stats.expired_count,
+            # FIX BUG 4: expõe skip reasons no snapshot para debug
+            "skip_reasons":              dict(self._skip_reasons),
+            "registered_markets":        len(self._markets),
         }
 
     # ── Avaliação de entrada ───────────────────────────────────────────────────
 
     def _evaluate(self, token_id: str, mid: float, bid: float, ask: float):
-        # 1. Warm-up
         if self._start_ts and (time.time() - self._start_ts) < self.WARMUP_SECONDS:
             return
 
@@ -295,22 +377,23 @@ class TradingSimulator:
         slug  = mkt["slug"]
         horiz = mkt["horizon_min"]
 
-        # 2. Cooldown por mercado
         if time.time() - self._cooldown.get(slug, 0) < self.COOLDOWN_SECONDS:
+            self._track_skip("cooldown")
             return
 
-        # 3. Mutex no check de MAX_OPEN_TRADES (sem race condition)
+        # FIX BUG 1: checagem com lock, resultado guardado em variável local
         with self._lock:
-            if len(self.open_trades) >= self.MAX_OPEN_TRADES:
-                return
+            open_count = len(self.open_trades)
+        if open_count >= self.MAX_OPEN_TRADES:
+            self._track_skip("max_open_trades")
+            return
 
-        # 4. Qualidade do buffer
         buf = self.buffers.get(sym)
         if not buf or len(buf.ticks) < self.MIN_TICKS or len(buf.candles_1m) < self.MIN_CANDLES:
+            self._track_skip(f"insufficient_data(ticks={len(buf.ticks) if buf else 0},candles={len(buf.candles_1m) if buf else 0})")
             self.stats.signals_skipped += 1
             return
 
-        # 5. Sinal com tipo de mercado
         sig = compute_signal(
             symbol=sym, buf=buf,
             market_price_yes=mid, horizon_minutes=int(horiz),
@@ -320,39 +403,50 @@ class TradingSimulator:
 
         if sig.direction == "SKIP":
             self.stats.signals_skipped += 1
+            self._track_skip(f"direction_skip(edge={sig.edge:.3f},conf={sig.confidence})")
             return
 
         if sig.confidence not in self.ALLOWED_CONF:
             self.stats.signals_skipped += 1
+            self._track_skip(f"confidence_low")
             return
 
         if abs(sig.edge) < self.MIN_EDGE.get(sig.confidence, 0.15):
             self.stats.signals_skipped += 1
+            self._track_skip(f"edge_too_low({sig.edge:.3f}<{self.MIN_EDGE.get(sig.confidence, 0.15)})")
             return
 
-        # 6. Consistência de momentum
         if sig.direction == "YES" and sig.momentum_1m < -0.10:
             self.stats.signals_skipped += 1
+            self._track_skip("momentum_conflict_YES")
             self._log("SKIP", f"{sym} YES vs mom1m {sig.momentum_1m:+.2f}%")
             return
         if sig.direction == "NO" and sig.momentum_1m > 0.10:
             self.stats.signals_skipped += 1
+            self._track_skip("momentum_conflict_NO")
             self._log("SKIP", f"{sym} NO vs mom1m {sig.momentum_1m:+.2f}%")
             return
 
         self.stats.signals_fired += 1
         self._place_trade(mkt, sym, sig, horiz, bid, ask)
 
+    def _track_skip(self, reason: str):
+        """FIX BUG 4: rastreia motivos de skip para debug."""
+        self._skip_reasons[reason] = self._skip_reasons.get(reason, 0) + 1
+        total = sum(self._skip_reasons.values())
+        # Log sumário a cada 200 skips ou a cada 5 minutos
+        if total % 200 == 0 or (time.time() - self._last_skip_log > 300 and total > 0):
+            top = sorted(self._skip_reasons.items(), key=lambda x: -x[1])[:5]
+            summary = " | ".join(f"{r}={c}" for r, c in top)
+            self._log("SKIP_SUMMARY", f"Total={total} Top: {summary}")
+            self._last_skip_log = time.time()
+
     def _place_trade(self, mkt: dict, sym: str, sig, horiz: float, bid: float, ask: float):
-        """
-        KELLY CORRETO:
-        f* = (b*p - q) / b
-        onde:
-          b = payoff por unidade apostada (1/entry_price - 1)
-          p = probabilidade estimada (sig.edge + 0.5 para YES)
-          q = 1 - p
-        """
         with self._lock:
+            # FIX BUG 1: reverifica MAX_OPEN_TRADES dentro do lock
+            if len(self.open_trades) >= self.MAX_OPEN_TRADES:
+                return
+
             if sig.direction == "YES":
                 action:      Literal["BUY_YES", "BUY_NO"] = "BUY_YES"
                 entry_price  = ask
@@ -378,8 +472,7 @@ class TradingSimulator:
             fee    = round(gross * POLYMARKET_FEE, 4)
             amount = round(gross - fee, 4)
 
-            total_cost = gross
-            if total_cost > self.stats.balance:
+            if gross > self.stats.balance:
                 return
 
             trade = Trade(
@@ -407,18 +500,18 @@ class TradingSimulator:
                 current_price      = (ask if action == "BUY_YES" else 1.0 - bid),
             )
 
-            self.stats.balance       -= total_cost
+            self.stats.balance       -= gross
             self.stats.total_trades  += 1
-            self.stats.total_wagered += total_cost
+            self.stats.total_wagered += gross
             self.stats.total_fees    += fee
             self.stats.last_action_ts = time.time()
             self.open_trades.append(trade)
             self._cooldown[mkt["slug"]] = time.time()
 
-        # ── Fase 1: registra sinal no DataCollector ───────────────────────────
+        # Fase 1: registra sinal no DataCollector
         if self.collector:
             try:
-                buf = self.buffers.get(sig.symbol if hasattr(sig, "symbol") else trade.symbol)
+                buf = self.buffers.get(trade.symbol)
                 bin_price = buf.latest_price() if buf else 0.0
                 trade._signal_id = self.collector.record_signal(
                     condition_id  = trade.condition_id,
@@ -463,14 +556,14 @@ class TradingSimulator:
             time.sleep(1.0)
 
     def _check_exits(self):
-        now        = time.time()
-        to_close:  list[tuple] = []
+        now       = time.time()
+        to_close: list[tuple] = []
 
         with self._lock:
             for t in list(self.open_trades):
-                mkt       = self._markets.get(t.token_id, {})
-                bid       = mkt.get("bid", t.entry_price)
-                ask_mkt   = mkt.get("ask", t.entry_price)
+                mkt     = self._markets.get(t.token_id, {})
+                bid     = mkt.get("bid", t.entry_price)
+                ask_mkt = mkt.get("ask", t.entry_price)
 
                 if t.action == "BUY_YES":
                     cur_val = ask_mkt
@@ -478,15 +571,15 @@ class TradingSimulator:
                     cur_val = 1.0 - bid
 
                 cur_val = max(0.01, min(0.99, cur_val))
-                t.unrealized_pnl  = round((cur_val / t.entry_price - 1) * t.amount_usdc, 3)
-                t.current_price   = ask_mkt if t.action == "BUY_YES" else 1.0 - bid
+                t.unrealized_pnl = round((cur_val / t.entry_price - 1) * t.amount_usdc, 3)
+                t.current_price  = ask_mkt if t.action == "BUY_YES" else 1.0 - bid
                 t.price_history.append(round(ask_mkt, 4))
                 if len(t.price_history) > 120:
                     t.price_history = t.price_history[-120:]
 
-                age_min = (now - t.entry_ts) / 60
-
+                age_min  = (now - t.entry_ts) / 60
                 sell_val = bid if t.action == "BUY_YES" else (1.0 - ask_mkt)
+
                 if sell_val < t.entry_price * (1 - self.STOP_LOSS_PCT):
                     to_close.append((t, "STOP_LOSS", False, sell_val))
                     continue
@@ -502,15 +595,19 @@ class TradingSimulator:
         for t, reason, won_arg, exit_val in to_close:
             self._resolve_and_close(t, reason, won_arg, exit_val)
 
+    # ── Fase 2: Lógica central de resolução ───────────────────────────────────
+
+    def _market_past_end_date(self, trade: Trade) -> bool:
+        if not trade.end_date_iso:
+            return True
+        try:
+            from datetime import datetime, timezone
+            end = datetime.fromisoformat(trade.end_date_iso.replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) > end
+        except Exception:
+            return True
+
     def _resolve_and_close(self, trade: Trade, reason: str, won_arg: bool | None, exit_val: float):
-        """
-        Resolução fiel ao Polymarket:
-        1. Tenta buscar resultado real via CLOB API
-        2. Se não disponível, usa movimento de preço Binance como proxy
-        3. WIN  → token vale $1.00 (payout = amount / entry_price)
-        4. LOSS → token vale $0.00 (perde tudo)
-        5. STOP_LOSS / TAKE_PROFIT → sai ao preço bid/ask atual
-        """
         if reason in ("STOP_LOSS", "TAKE_PROFIT"):
             won = (reason == "TAKE_PROFIT")
             self._close(trade, reason, won, exit_val)
@@ -526,30 +623,174 @@ class TradingSimulator:
         if real_outcome is not None:
             won = real_outcome if trade.action == "BUY_YES" else (not real_outcome)
             self.stats.real_resolutions += 1
-            trade._resolved_real = True   # flag para collector
-            self._log("RESOLVE_REAL",
-                      f"Resultado REAL {trade.symbol}: {'YES' if real_outcome else 'NO'} "
-                      f"(real={self.stats.real_resolutions} sim={self.stats.simulated_resolutions})")
-        elif won_arg is not None:
-            won = won_arg
-        else:
-            won = self._simulate_resolution(trade)
-            self.stats.simulated_resolutions += 1
-            self._log("RESOLVE_SIMULATED",
-                      f"Proxy Binance {trade.symbol} "
-                      f"(real={self.stats.real_resolutions} sim={self.stats.simulated_resolutions})")
+            trade._resolved_real = True
+            self._log(
+                "RESOLVE_REAL",
+                f"Resultado REAL {trade.symbol}: {'YES' if real_outcome else 'NO'} "
+                f"(real={self.stats.real_resolutions} sim={self.stats.simulated_resolutions})"
+            )
+            self._close(trade, reason, won, exit_val)
 
-        self._close(trade, reason, won, exit_val)
+        elif self._market_past_end_date(trade):
+            self._enter_pending(trade)
+
+        else:
+            won = won_arg if won_arg is not None else self._simulate_resolution(trade)
+            self.stats.simulated_resolutions += 1
+            self._log(
+                "RESOLVE_SIMULATED",
+                f"Proxy Binance {trade.symbol} "
+                f"(real={self.stats.real_resolutions} sim={self.stats.simulated_resolutions})"
+            )
+            self._close(trade, reason, won, exit_val)
+
+    def _enter_pending(self, trade: Trade):
+        with self._lock:
+            if trade not in self.open_trades:
+                return
+            self.open_trades.remove(trade)
+
+        trade.status             = "PENDING"
+        trade.pending_resolution = True
+        trade.pending_since_ts   = time.time()
+        trade.unrealized_pnl     = 0.0
+
+        with self._pending_lock:
+            self._pending_resolution.append(trade)
+
+        self._log(
+            "PENDING_RESOLUTION",
+            f"⏳ {trade.symbol} {trade.action} aguardando oracle "
+            f"| condition_id={trade.condition_id[:12]}… "
+            f"| gross=${trade.gross_usdc:.2f}",
+            level="info",
+            trade_id=trade.id,
+            symbol=trade.symbol,
+        )
+
+    # ── Fase 2: Worker de resolução ────────────────────────────────────────────
+
+    def _resolution_worker(self):
+        print("[ResolutionWorker] Iniciado — verificação a cada 5min")
+        while self._running:
+            time.sleep(RESOLUTION_WORKER_INTERVAL)
+
+            if not self._running:
+                break
+
+            with self._pending_lock:
+                pending_snapshot = list(self._pending_resolution)
+
+            if not pending_snapshot:
+                continue
+
+            self._log(
+                "RESOLUTION_CHECK",
+                f"Verificando {len(pending_snapshot)} trade(s) pendente(s)…",
+                level="info",
+            )
+
+            resolved_ids: list[str] = []
+
+            for trade in pending_snapshot:
+                if not self._running:
+                    break
+
+                waiting_secs = time.time() - trade.pending_since_ts
+
+                if waiting_secs >= PENDING_EXPIRY_SECONDS:
+                    self._expire_pending(trade)
+                    resolved_ids.append(trade.id)
+                    continue
+
+                real_outcome = None
+                try:
+                    real_outcome = fetch_market_resolution(trade.condition_id)
+                except Exception as e:
+                    self._log("RESOLUTION_ERR", f"{trade.symbol}: {e}", level="error")
+                    continue
+
+                if real_outcome is not None:
+                    won = real_outcome if trade.action == "BUY_YES" else (not real_outcome)
+                    self.stats.real_resolutions += 1
+                    trade._resolved_real = True
+                    self._close_pending(trade, won, real_outcome)
+                    resolved_ids.append(trade.id)
+                else:
+                    mins_waiting = round(waiting_secs / 60, 1)
+                    self._log(
+                        "PENDING_STILL",
+                        f"⏳ {trade.symbol} ainda sem resultado | {mins_waiting}min aguardando",
+                        level="info",
+                    )
+
+            if resolved_ids:
+                with self._pending_lock:
+                    self._pending_resolution = [
+                        t for t in self._pending_resolution
+                        if t.id not in resolved_ids
+                    ]
+
+    def _close_pending(self, trade: Trade, won: bool, real_outcome: bool):
+        exit_val = 1.0 if won else 0.0
+
+        self._log(
+            "RESOLVE_REAL",
+            f"✓ Resultado REAL (da fila) {trade.symbol}: {'YES' if real_outcome else 'NO'} "
+            f"| {trade.action} | {'WIN' if won else 'LOSS'} "
+            f"| aguardou {round((time.time() - trade.pending_since_ts) / 60, 1)}min",
+            level="win" if won else "loss",
+        )
+
+        with self._lock:
+            trade.status             = "OPEN"
+            trade.pending_resolution = False
+            self.open_trades.append(trade)
+
+        self._close(trade, "RESOLVE_REAL", won, exit_val)
+
+    def _expire_pending(self, trade: Trade):
+        self.stats.expired_count += 1
+
+        trade.status      = "CLOSED"
+        trade.exit_ts     = time.time()
+        trade.exit_reason = "EXPIRED_NO_RESOLUTION"
+        trade.pnl_usdc    = 0.0
+        trade.pnl_pct     = 0.0
+        trade.won         = None
+
+        with self._lock:
+            self.closed_trades.append(trade)
+
+        if self.collector:
+            try:
+                self.collector.record_trade_outcome(
+                    condition_id      = trade.condition_id,
+                    signal_id         = getattr(trade, "_signal_id", 0),
+                    entry_ts          = trade.entry_ts,
+                    entry_price       = trade.entry_price,
+                    action            = trade.action,
+                    outcome_yes       = None,
+                    won               = None,
+                    resolution_source = "pending",
+                    pnl               = 0.0,
+                    closed_ts         = time.time(),
+                )
+            except Exception:
+                pass
+
+        self._log(
+            "TRADE_EXPIRED",
+            f"⚠️  {trade.symbol} {trade.action} expirado após 48h sem resolução "
+            f"| gross=${trade.gross_usdc:.2f} | condition_id={trade.condition_id[:12]}…",
+            level="loss",
+            trade_id=trade.id,
+            symbol=trade.symbol,
+        )
+
+    # ── Fechamento de trade ────────────────────────────────────────────────────
 
     def _simulate_resolution(self, trade: Trade) -> bool:
-        """
-        Proxy de resolução quando a API não retorna resultado ainda.
-        Usa movimento do spot Binance desde a entrada do trade.
-
-        FIX v3.1: busca o tick com timestamp mais próximo (e >= entry_ts),
-        iterando do mais antigo para o mais recente para garantir o primeiro
-        tick após a entrada — não apenas o mais recente acima do threshold.
-        """
         buf = self.buffers.get(trade.symbol)
         if not buf:
             return random.random() < 0.47
@@ -558,16 +799,13 @@ class TradingSimulator:
         if p_now is None:
             return random.random() < 0.47
 
-        # FIX: itera do início (mais antigo) para o fim (mais recente) e
-        # pega o PRIMEIRO tick com ts >= entry_ts (tick logo após a entrada)
         p_entry = None
-        ticks_list = list(buf.ticks)  # deque → lista para iterar em ordem
+        ticks_list = list(buf.ticks)
         for ts, p in ticks_list:
             if ts >= trade.entry_ts:
                 p_entry = p
                 break
 
-        # Fallback: se nenhum tick após entry_ts, usa o mais antigo disponível
         if p_entry is None and ticks_list:
             p_entry = ticks_list[0][1]
 
@@ -583,12 +821,6 @@ class TradingSimulator:
             return (pct + noise) < -0.05
 
     def _close(self, trade: Trade, reason: str, won: bool, exit_val: float):
-        """
-        Fechamento fiel ao Polymarket:
-        WIN  → payout = amount_usdc / entry_price  (token resolve a $1.00)
-        LOSS → payout = $0.00                      (token resolve a $0.00)
-        STOP/TP → payout proporcional ao exit_val
-        """
         with self._lock:
             if trade not in self.open_trades:
                 return
@@ -626,8 +858,8 @@ class TradingSimulator:
             trade.pnl_pct     = round(pnl / trade.amount_usdc * 100, 1)
             trade.won         = won
             trade.unrealized_pnl = 0.0
-            self.stats.total_pnl     += pnl
-            self.stats.last_action_ts = time.time()
+            self.stats.total_pnl      += pnl
+            self.stats.last_action_ts  = time.time()
 
             if won:
                 self.stats.win_streak  += 1
@@ -649,10 +881,8 @@ class TradingSimulator:
             self.open_trades.remove(trade)
             self.closed_trades.append(trade)
 
-        # ── Fase 1: registra outcome no DataCollector ─────────────────────────
         if self.collector:
             try:
-                # Determina outcome_yes: se foi WIN em BUY_YES → YES venceu, etc.
                 if trade.won is not None:
                     outcome_yes = (trade.won == (trade.action == "BUY_YES"))
                 else:
@@ -683,7 +913,7 @@ class TradingSimulator:
             reason=reason, symbol=trade.symbol, amount=trade.amount_usdc,
         )
 
-        if reason == "EXPIRED" and trade.token_id in self._markets:
+        if reason in ("EXPIRED", "RESOLVE_REAL") and trade.token_id in self._markets:
             self._markets[trade.token_id]["resolved"] = True
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -693,8 +923,8 @@ class TradingSimulator:
             for t in self.open_trades:
                 if t.token_id == token_id:
                     cur = mid if t.action == "BUY_YES" else 1.0 - mid
-                    t.current_price   = mid
-                    t.unrealized_pnl  = round((cur / t.entry_price - 1) * t.amount_usdc, 3)
+                    t.current_price  = mid
+                    t.unrealized_pnl = round((cur / t.entry_price - 1) * t.amount_usdc, 3)
 
     def _update_equity(self):
         with self._lock:
@@ -710,16 +940,12 @@ class TradingSimulator:
             if dd > self.stats.max_drawdown_pct:
                 self.stats.max_drawdown_pct = round(dd, 4)
 
-    # ── Helpers de teste (não usados em produção) ──────────────────────────────
+    # ── Helpers de teste ───────────────────────────────────────────────────────
 
     def _place_trade_direct(self, mkt: dict, sym: str, sig, horiz: float, bid: float, ask: float):
-        """
-        Abre um trade diretamente, sem verificar cooldown/warmup.
-        Usado exclusivamente pelos testes unitários.
-        """
+        """Abre trade diretamente sem cooldown/warmup. Apenas para testes."""
         with self._lock:
             if sig.direction == "YES":
-                from typing import Literal
                 action = "BUY_YES"
                 entry_price = ask
                 p_est = max(0.05, min(0.95, 0.5 + sig.edge))
@@ -740,11 +966,9 @@ class TradingSimulator:
             gross = min(gross, max_bet, self.stats.balance * 0.06)
             fee = round(gross * POLYMARKET_FEE, 4)
             amount = round(gross - fee, 4)
-            total_cost = gross
-            if total_cost > self.stats.balance:
+            if gross > self.stats.balance:
                 return None
 
-            import uuid
             trade = Trade(
                 id=str(uuid.uuid4())[:8],
                 symbol=sym,
@@ -769,18 +993,15 @@ class TradingSimulator:
                 market_type=sig.market_type,
                 current_price=(ask if action == "BUY_YES" else 1.0 - bid),
             )
-            self.stats.balance -= total_cost
+            self.stats.balance -= gross
             self.stats.total_trades += 1
-            self.stats.total_wagered += total_cost
+            self.stats.total_wagered += gross
             self.stats.total_fees += fee
             self.open_trades.append(trade)
         return trade
 
     def close_trade(self, trade: Trade, won: bool, reason: str = "EXPIRED"):
-        """
-        Fecha um trade manualmente.
-        Usado exclusivamente pelos testes unitários.
-        """
+        """Fecha trade manualmente. Apenas para testes."""
         with self._lock:
             if trade not in self.open_trades:
                 return None

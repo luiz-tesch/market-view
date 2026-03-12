@@ -1,16 +1,14 @@
 """
-src/feed/polymarket.py  v2.2
-Correções v2.1:
-- enrich_prices_background: prioriza short-term markets (3-120min) antes de
-  enriquecer os demais, removendo o cap arbitrário de [:30]
-
-Correções v2.2:
-- fetch_market_resolution: reescrito com cascata de 3 fontes independentes
-  FONTE 1 — Gamma API: outcomePrices converge para ["1","0"] ou ["0","1"] na resolução
-  FONTE 2 — CLOB /markets/{id}: campo `tokens[].winner` + campo `resolved`
-  FONTE 3 — CLOB prices-history: convergência do preço para >= 0.97 ou <= 0.03
-  Razão: o CLOB raramente preenche `outcome` a tempo; o Gamma é mais rápido e
-  confiável para refletir a resolução real on-chain do CTF oracle (UMA).
+src/feed/polymarket.py  v2.3
+Correções v2.3:
+- fetch_gamma_markets: logging detalhado de cada filtro descartado
+- Filtros muito menos restritivos (min_liquidity padrão: 10 → era 50)
+- Aceita campo 'liquidity' além de 'liquidityNum' (API pode ter renomeado)
+- Aceita campo 'volume' além de 'volumeNum'
+- endDate fallback mais robusto — aceita formatos variados da API
+- Adiciona keyword "pol" e "polygon" ao MATIC, "xrp" já estava ok
+- is_short_term: aumenta tolerância para mercados de "hoje" (até 240min)
+- fetch_short_term_markets: usa max_days=7 em vez de 1
 """
 from __future__ import annotations
 import asyncio
@@ -39,6 +37,7 @@ SYMBOL_STREAMS: dict[str, str] = {
     "BNB":   "bnbusdt",
     "MATIC": "maticusdt",
     "DOGE":  "dogeusdt",
+    "XRP":   "xrpusdt",
 }
 STREAM_TO_SYM: dict[str, str] = {v: k for k, v in SYMBOL_STREAMS.items()}
 
@@ -46,8 +45,8 @@ CRYPTO_KEYWORDS: dict[str, list[str]] = {
     "BTC":   ["bitcoin", "btc"],
     "ETH":   ["ethereum", "eth"],
     "SOL":   ["solana", "sol"],
-    "BNB":   ["bnb", "binance coin"],
-    "MATIC": ["matic", "polygon"],
+    "BNB":   ["bnb", "binance coin", "binance"],
+    "MATIC": ["matic", "polygon", "pol"],
     "DOGE":  ["dogecoin", "doge"],
     "XRP":   ["ripple", "xrp"],
 }
@@ -81,7 +80,29 @@ class PolyMarket:
         except Exception:
             return 9999.0
 
+    def _horizon_from_title(self) -> float | None:
+        import re
+        q = self.question.lower()
+        if "up or down" not in q:
+            return None
+        m = re.search(r"(\d{1,2}):(\d{2})(am|pm)-(\d{1,2}):(\d{2})(am|pm)", q)
+        if m:
+            h1, m1, p1, h2, m2, p2 = m.groups()
+            h1, m1, h2, m2 = int(h1), int(m1), int(h2), int(m2)
+            if p1 == "pm" and h1 != 12: h1 += 12
+            if p2 == "pm" and h2 != 12: h2 += 12
+            diff = (h2 * 60 + m2) - (h1 * 60 + m1)
+            return float(diff) if diff > 0 else float(diff + 1440)
+        if "5 min"  in q: return 5.0
+        if "15 min" in q: return 15.0
+        if "30 min" in q: return 30.0
+        if "1 hour" in q or "60 min" in q: return 60.0
+        return None
+
     def is_short_term(self) -> bool:
+        horizon = self._horizon_from_title()
+        if horizon is not None:
+            return SHORT_TERM_MIN_MINUTES <= horizon <= SHORT_TERM_MAX_MINUTES
         ml = self.mins_left()
         return SHORT_TERM_MIN_MINUTES <= ml <= SHORT_TERM_MAX_MINUTES
 
@@ -115,18 +136,74 @@ def _detect_symbol(question: str) -> str | None:
     return None
 
 
+def _parse_end_date(m: dict) -> str | None:
+    """
+    Tenta extrair end_date do mercado em vários formatos que a API pode usar.
+    Retorna ISO string ou None se não encontrar.
+    """
+    # Tenta campos em ordem de preferência
+    for field in ("endDateIso", "endDate", "end_date_iso", "end_date", "expirationDate"):
+        v = m.get(field)
+        if v and isinstance(v, str) and len(v) >= 8:
+            # Normaliza para ISO
+            if "T" not in v:
+                v = v + "T23:59:00Z"
+            if not v.endswith("Z") and "+" not in v:
+                v = v + "Z"
+            return v
+    return None
+
+
+def _parse_liquidity(m: dict) -> float:
+    """Tenta vários campos de liquidity que a API pode usar."""
+    for field in ("liquidityNum", "liquidity", "liquidityClob", "liq"):
+        v = m.get(field)
+        if v is not None:
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
+def _parse_volume(m: dict) -> float:
+    """Tenta vários campos de volume que a API pode usar."""
+    for field in ("volumeNum", "volume", "volume24h", "vol"):
+        v = m.get(field)
+        if v is not None:
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
 def fetch_gamma_markets(
     limit: int = 300,
-    min_liquidity: float = 50.0,
+    min_liquidity: float = 10.0,   # era 50 — reduzido para não filtrar tudo
     max_days: float = 90.0,
+    _debug: bool = True,           # loga quantos caem em cada filtro
 ) -> list[PolyMarket]:
     """Busca mercados cripto ativos. Retorna lista ordenada por volume."""
+
+    # Contadores para debug
+    counts = {
+        "total_raw":     0,
+        "no_symbol":     0,
+        "no_token_ids":  0,
+        "no_end_date":   0,
+        "expired":       0,
+        "too_far":       0,
+        "low_liquidity": 0,
+        "accepted":      0,
+    }
+
     try:
         r = requests.get(
             GAMMA_URL,
             params={
                 "active": "true", "closed": "false",
-                "limit": limit, "order": "volumeNum", "ascending": "false",
+                "limit": limit, "order": "startDate", "ascending": "false",
             },
             timeout=15,
         )
@@ -137,20 +214,54 @@ def fetch_gamma_markets(
         print(f"[Gamma] Fetch error: {e}")
         return []
 
+    counts["total_raw"] = len(items)
     result: list[PolyMarket] = []
+
     for m in items:
         q   = m.get("question", "")
         sym = _detect_symbol(q)
         if not sym:
+            counts["no_symbol"] += 1
             continue
 
+        # Token IDs
         try:
-            tids = json.loads(m.get("clobTokenIds", "[]"))
-            if len(tids) < 2:
+            tids_raw = m.get("clobTokenIds", "[]")
+            tids = json.loads(tids_raw) if isinstance(tids_raw, str) else tids_raw
+            if not isinstance(tids, list) or len(tids) < 2:
+                counts["no_token_ids"] += 1
                 continue
         except Exception:
+            counts["no_token_ids"] += 1
             continue
 
+        # End date
+        end_iso = _parse_end_date(m)
+        if not end_iso:
+            counts["no_end_date"] += 1
+            continue
+
+        # Validar end date e filtrar por max_days
+        try:
+            from datetime import datetime, timezone
+            end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            mins_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 60
+            if mins_left < -60:   # mercados expirados há mais de 1h
+                counts["expired"] += 1
+                continue
+            if mins_left > max_days * 1440:
+                counts["too_far"] += 1
+                continue
+        except Exception:
+            pass  # se falhou em parsear, inclui mesmo assim
+
+        # Liquidity
+        liq = _parse_liquidity(m)
+        if liq < min_liquidity:
+            counts["low_liquidity"] += 1
+            continue
+
+        # Prices
         try:
             prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
             yes_p  = float(prices[0])
@@ -158,24 +269,7 @@ def fetch_gamma_markets(
         except Exception:
             yes_p, no_p = 0.5, 0.5
 
-        end_iso = m.get("endDateIso") or m.get("endDate", "")
-        if end_iso and "T" not in end_iso:
-            end_iso += "T23:59:00Z"
-
-        try:
-            from datetime import datetime, timezone
-            end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-            mins_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 60
-            if mins_left < 0 or mins_left > max_days * 1440:
-                continue
-        except Exception:
-            pass
-
-        liq = float(m.get("liquidityNum") or m.get("liquidity") or 0)
-        if liq < min_liquidity:
-            continue
-
-        vol          = float(m.get("volumeNum") or m.get("volume") or 0)
+        vol          = _parse_volume(m)
         condition_id = m.get("conditionId") or m.get("condition_id") or ""
 
         result.append(PolyMarket(
@@ -193,14 +287,39 @@ def fetch_gamma_markets(
             image        = m.get("image", "") or m.get("icon", "") or "",
             description  = (m.get("description", "") or "")[:200],
         ))
+        counts["accepted"] += 1
 
-    print(f"[Gamma] {len(items)} total → {len(result)} crypto markets")
+    if _debug:
+        total = counts["total_raw"]
+        print(
+            f"[Gamma] {total} raw → "
+            f"{counts['no_symbol']} no_sym · "
+            f"{counts['no_token_ids']} no_tids · "
+            f"{counts['no_end_date']} no_date · "
+            f"{counts['expired']} expired · "
+            f"{counts['too_far']} too_far · "
+            f"{counts['low_liquidity']} low_liq → "
+            f"{counts['accepted']} accepted"
+        )
+
+    # Se zero aceitados, loga amostra para diagnóstico
+    if counts["accepted"] == 0 and items:
+        print("[Gamma] DEBUG — primeiros 3 itens da API:")
+        for i, m in enumerate(items[:3]):
+            print(f"  [{i}] question={m.get('question','')[:60]}")
+            print(f"       liquidityNum={m.get('liquidityNum')} liquidity={m.get('liquidity')}")
+            print(f"       endDateIso={m.get('endDateIso')} endDate={m.get('endDate')}")
+            print(f"       clobTokenIds={str(m.get('clobTokenIds',''))[:60]}")
+            print(f"       active={m.get('active')} closed={m.get('closed')}")
+
     return result
 
 
-def fetch_short_term_markets(min_liquidity: float = 100.0) -> list[PolyMarket]:
+def fetch_short_term_markets(min_liquidity: float = 10.0) -> list[PolyMarket]:
     """Busca APENAS mercados de curto prazo (3–120 min)."""
-    all_markets  = fetch_gamma_markets(limit=500, min_liquidity=min_liquidity, max_days=1)
+    # max_days=7 em vez de 1 para não perder mercados que vencem nos próximos dias
+    # mas cujo endDate está dentro do range short-term
+    all_markets  = fetch_gamma_markets(limit=500, min_liquidity=min_liquidity, max_days=7)
     short        = [m for m in all_markets if m.is_short_term()]
     print(f"[Gamma] Short-term ({SHORT_TERM_MIN_MINUTES}-{SHORT_TERM_MAX_MINUTES}min): {len(short)} mercados")
     return short
@@ -239,28 +358,6 @@ def fetch_market_resolution(condition_id: str) -> bool | None:
     """
     Busca se um mercado já resolveu e qual foi o resultado.
     Retorna True (YES venceu), False (NO venceu), ou None (não resolvido / erro).
-
-    Estratégia em cascata — 3 fontes independentes:
-
-    FONTE 1 — Gamma API (mais confiável para resolução)
-      Quando um mercado resolve, o Gamma atualiza outcomePrices para ["1","0"]
-      (YES ganhou) ou ["0","1"] (NO ganhou). Também expõe campo `closed: true`.
-      Esta é a fonte primária porque é onde a resolução é registrada primeiro.
-
-    FONTE 2 — CLOB REST /markets/{conditionId}
-      Fonte secundária. O campo `resolved` existe mas é preenchido com atraso.
-      Verificamos também os tokens: quando YES resolve $1, o token YES terá
-      `winner: true` na resposta do CLOB.
-
-    FONTE 3 — CLOB /prices-history (último preço convergiu para 0 ou 1)
-      Se os preços históricos do token YES convergiram para >= 0.97 ou <= 0.03,
-      o mercado provavelmente resolveu. Usado como fallback de último recurso.
-
-    Notas sobre o mecanismo real do Polymarket:
-    - Mercados short-term (crypto price) resolvem automaticamente via UMA oracle
-    - A resolução é on-chain: o smart contract do CTF atualiza o payout
-    - O Gamma API reflete isso em outcomePrices dentro de minutos
-    - O campo `outcome` do CLOB é frequentemente vazio mesmo após resolução
     """
     if not condition_id:
         return None
@@ -278,25 +375,18 @@ def fetch_market_resolution(condition_id: str) -> bool | None:
             for m in items:
                 if m.get("conditionId") != condition_id:
                     continue
-
-                # Mercado ainda ativo — não resolveu
                 if m.get("active") and not m.get("closed"):
                     return None
-
-                # outcomePrices converge para ["1","0"] ou ["0","1"] na resolução
                 try:
                     prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
                     yes_p  = float(prices[0])
                     no_p   = float(prices[1]) if len(prices) > 1 else 1 - yes_p
-
-                    if yes_p >= 0.99:   # YES resolveu
+                    if yes_p >= 0.99:
                         return True
-                    if no_p >= 0.99:    # NO resolveu (YES = 0)
+                    if no_p >= 0.99:
                         return False
                 except Exception:
                     pass
-
-                # Fallback: campo outcome explícito no Gamma
                 outcome = m.get("outcome", "")
                 if isinstance(outcome, str) and outcome:
                     up = outcome.strip().upper()
@@ -304,20 +394,14 @@ def fetch_market_resolution(condition_id: str) -> bool | None:
                         return True
                     if up in ("NO", "0", "FALSE", "LOSS"):
                         return False
-
     except Exception as e:
         print(f"[Resolution] Gamma source failed for {condition_id[:12]}: {e}")
 
     # ── FONTE 2: CLOB /markets/{conditionId} ──────────────────────────────────
     try:
-        r = requests.get(
-            f"{CLOB_URL}/markets/{condition_id}",
-            timeout=8,
-        )
+        r = requests.get(f"{CLOB_URL}/markets/{condition_id}", timeout=8)
         if r.status_code == 200:
             data = r.json()
-
-            # Campo resolved explícito (preenchido com atraso pelo CLOB)
             if data.get("resolved"):
                 outcome = data.get("outcome", "")
                 if isinstance(outcome, str) and outcome:
@@ -326,39 +410,28 @@ def fetch_market_resolution(condition_id: str) -> bool | None:
                         return True
                     if up in ("NO", "0", "FALSE"):
                         return False
-
-            # Tokens: winner:true indica qual lado venceu
             tokens = data.get("tokens", [])
             for token in tokens:
                 if token.get("winner") is True:
                     outcome_name = token.get("outcome", "").upper()
                     return outcome_name in ("YES", "1")
-
     except Exception as e:
         print(f"[Resolution] CLOB source failed for {condition_id[:12]}: {e}")
 
-    # ── FONTE 3: CLOB prices-history — convergência de preço ─────────────────
-    # Busca o token_id YES correspondente ao condition_id.
-    # Se o último preço histórico convergiu para >=0.97 ou <=0.03, inferimos resolução.
-    # Nota: esta fonte NÃO é 100% confiável — preços podem estar próximos de 0/1
-    # antes da resolução formal. Usar apenas se fontes 1 e 2 falharam.
+    # ── FONTE 3: prices-history ────────────────────────────────────────────────
     try:
-        r = requests.get(
-            GAMMA_URL,
-            params={"conditionId": condition_id},
-            timeout=5,
-        )
+        r = requests.get(GAMMA_URL, params={"conditionId": condition_id}, timeout=5)
         if r.status_code == 200:
             items = r.json()
             items = items if isinstance(items, list) else items.get("data", [])
             for m in items:
                 if m.get("conditionId") != condition_id:
                     continue
-                tids = json.loads(m.get("clobTokenIds", "[]"))
+                tids_raw = m.get("clobTokenIds", "[]")
+                tids = json.loads(tids_raw) if isinstance(tids_raw, str) else tids_raw
                 if not tids:
                     break
                 yes_token = tids[0]
-
                 rh = requests.get(
                     f"{CLOB_URL}/prices-history",
                     params={"market": yes_token, "interval": "1m", "fidelity": 1},
@@ -382,13 +455,9 @@ def fetch_market_resolution(condition_id: str) -> bool | None:
 def enrich_prices_background(markets: list[PolyMarket]) -> None:
     """
     Atualiza yes_price dos mercados via CLOB REST em background thread.
-    FIX v2.1: prioriza short-term markets (que são os relevantes para o
-    simulador), depois enriquece os demais — sem cap arbitrário de [:30].
-
-    Rate limit amigável: 50ms entre requisições (~20 req/s).
+    Prioriza short-term markets.
     """
     def _worker():
-        # Ordena: short-term primeiro (mais críticos para o simulador)
         short_term = [m for m in markets if m.is_short_term()]
         others     = [m for m in markets if not m.is_short_term()]
         ordered    = short_term + others
@@ -401,7 +470,7 @@ def enrich_prices_background(markets: list[PolyMarket]) -> None:
                     m.yes_price = mid
                     m.no_price  = 1 - mid
                     enriched += 1
-                time.sleep(0.05)   # 50ms entre requests
+                time.sleep(0.05)
             except Exception:
                 pass
 
@@ -414,15 +483,7 @@ def enrich_prices_background(markets: list[PolyMarket]) -> None:
 # ── CLOB WebSocket ─────────────────────────────────────────────────────────────
 
 class ClobFeed:
-    """
-    WebSocket CLOB do Polymarket — updates de preço em tempo real.
-    """
-
-    def __init__(
-        self,
-        token_ids: list[str],
-        on_update: Callable[[str, float, float], None],
-    ):
+    def __init__(self, token_ids: list[str], on_update: Callable[[str, float, float], None]):
         self.token_ids = token_ids
         self.on_update = on_update
         self._running  = False
@@ -547,10 +608,6 @@ class ClobFeed:
 # ── Binance WebSocket ──────────────────────────────────────────────────────────
 
 class BinanceFeed:
-    """
-    aggTrade stream do Binance.
-    """
-
     def __init__(self, symbols: list[str], on_tick: Callable[[str, float, float], None]):
         self.symbols   = [s for s in symbols if s in SYMBOL_STREAMS]
         self.on_tick   = on_tick
@@ -574,9 +631,7 @@ class BinanceFeed:
         loop.run_until_complete(self._stream())
 
     async def _stream(self):
-        streams = "/".join(
-            f"{SYMBOL_STREAMS[s]}@aggTrade" for s in self.symbols
-        )
+        streams = "/".join(f"{SYMBOL_STREAMS[s]}@aggTrade" for s in self.symbols)
         url = f"{BIN_WS}?streams={streams}"
         while self._running:
             try:
@@ -606,9 +661,10 @@ class BinanceFeed:
 # ── Mock Binance ───────────────────────────────────────────────────────────────
 
 class MockBinanceFeed:
-    """Mock Binance — random walk com preços realistas."""
-    BASE = {"BTC": 83000., "ETH": 3200., "SOL": 145., "BNB": 580., "MATIC": 0.85, "DOGE": 0.13}
-    VOL  = {"BTC": 0.0005, "ETH": 0.0009, "SOL": 0.0014, "BNB": 0.0008, "MATIC": 0.002, "DOGE": 0.002}
+    BASE = {"BTC": 83000., "ETH": 3200., "SOL": 145., "BNB": 580.,
+            "MATIC": 0.85, "DOGE": 0.13, "XRP": 0.60}
+    VOL  = {"BTC": 0.0005, "ETH": 0.0009, "SOL": 0.0014, "BNB": 0.0008,
+            "MATIC": 0.002, "DOGE": 0.002, "XRP": 0.0015}
 
     def __init__(self, symbols: list[str], on_tick: Callable[[str, float, float], None]):
         self.symbols    = symbols
@@ -648,9 +704,27 @@ class MockBinanceFeed:
 
 class MockClobFeed:
     """
-    Mock CLOB — usa mercados REAIS da Gamma API, simula movimento de preço.
-    Influenciado pelo spot Binance para mercados de preço.
+    Simula preços do CLOB com realismo.
+
+    Ao invés de random walk a partir de 0.50 (que nunca gera edge suficiente),
+    calcula um preço justo baseado no preço spot do Binance vs o strike implícito
+    do mercado, depois aplica ruído de mercado em cima.
+
+    Resultado: preços variam entre 0.10–0.90 dependendo do contexto,
+    gerando edges reais (≥ 0.09) com frequência suficiente para trades.
     """
+
+    # Vol implícita por símbolo para calcular p_fair
+    # Calibrada para horizonte de ~60 min
+    IMPL_VOL: dict[str, float] = {
+        "BTC":   0.012,   # BTC ~1.2%/h
+        "ETH":   0.018,
+        "SOL":   0.025,
+        "BNB":   0.016,
+        "MATIC": 0.030,
+        "DOGE":  0.028,
+        "XRP":   0.020,
+    }
 
     def __init__(
         self,
@@ -666,13 +740,79 @@ class MockClobFeed:
         self.msg_count     = 0
         self.last_ts       = 0.0
         self.latencies:    list[float] = []
-        self._probs: dict[str, float]  = {m.token_id: m.yes_price for m in markets}
+
+        # Preço simulado por token_id — inicializado de forma realista
+        self._probs: dict[str, float] = {}
+        for m in markets:
+            self._probs[m.token_id] = self._initial_price(m)
+
+    def _initial_price(self, m: PolyMarket) -> float:
+        """Calcula preço inicial realista baseado no preço spot vs strike implícito."""
+        buf = self.price_buffers.get(m.symbol)
+        spot = buf.latest_price() if buf else None
+        return self._fair_price(m, spot)
+
+    def _fair_price(self, m: PolyMarket, spot: float | None) -> float:
+        """
+        Estima probabilidade fair do YES baseado no preço spot atual.
+        Se não tem spot, usa yes_price da Gamma API como fallback.
+        """
+        if spot is None or spot <= 0:
+            return m.yes_price if 0.05 <= m.yes_price <= 0.95 else 0.50
+
+        # Extrai strike implícito da question (ex: "BTC above $85,000")
+        strike = self._extract_strike(m.question, m.symbol, spot)
+        if strike is None or strike <= 0:
+            return m.yes_price if 0.05 <= m.yes_price <= 0.95 else 0.50
+
+        # Horizonte em horas (mínimo 5 min)
+        horizon_h = max(m.mins_left(), 5) / 60.0
+
+        # Vol ajustada para o horizonte: vol_h = daily_vol * sqrt(horizon_h / 24)
+        daily_vol = self.IMPL_VOL.get(m.symbol, 0.020) * math.sqrt(24)
+        vol_h     = daily_vol * math.sqrt(horizon_h / 24)
+
+        # z-score: quão longe está o spot do strike em desvios padrão
+        z = (math.log(spot / strike)) / vol_h
+
+        # YES = P(spot > strike em T) ≈ N(z) para movimento log-normal
+        p = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+        return max(0.05, min(0.95, p))
+
+    @staticmethod
+    def _extract_strike(question: str, symbol: str, spot: float) -> float | None:
+        """Extrai o strike price da pergunta. Ex: 'BTC above $85,000' → 85000.0"""
+        import re
+        q = question.lower()
+
+        # Padrões: "$85,000", "$85k", "85000", "85,000"
+        patterns = [
+            r'\$\s*([\d,]+(?:\.\d+)?)\s*k\b',   # $85k
+            r'\$\s*([\d,]+(?:\.\d+)?)',            # $85,000 ou $85000
+            r'\b([\d,]{4,}(?:\.\d+)?)\b',         # 85000 ou 85,000 sem $
+        ]
+
+        for pat in patterns:
+            m = re.search(pat, q)
+            if m:
+                raw = m.group(1).replace(",", "")
+                try:
+                    val = float(raw)
+                    # Se usou "k" multiplica por 1000
+                    if 'k' in pat:
+                        val *= 1000
+                    # Sanity check: strike deve ser razoável vs spot
+                    if 0.1 * spot <= val <= 10 * spot:
+                        return val
+                except ValueError:
+                    continue
+        return None
 
     def start(self):
         self._running  = True
         self.connected = True
         threading.Thread(target=self._loop, daemon=True, name="MockClob").start()
-        print(f"[MockClob] Simulating {len(self.markets)} real Polymarket markets")
+        print(f"[MockClob] Simulating {len(self.markets)} markets with realistic pricing")
 
     def stop(self):
         self._running = False
@@ -686,24 +826,26 @@ class MockClobFeed:
         while self._running:
             active = [m for m in self.markets if m.mins_left() > 0.5]
             for m in active:
-                influence = 0.0
-                buf = self.price_buffers.get(m.symbol)
-                if buf:
-                    p_now = buf.latest_price()
-                    p_ago = buf.price_n_seconds_ago(60)
-                    if p_now and p_ago and p_ago != 0:
-                        pct       = (p_now / p_ago - 1) * 100
-                        influence = pct * 0.08
+                buf  = self.price_buffers.get(m.symbol)
+                spot = buf.latest_price() if buf else None
 
-                noise = random.gauss(0, 0.004)
-                drift = math.sin(t / 100 + hash(m.slug[:8]) % 30) * 0.001
-                new_p = self._probs.get(m.token_id, m.yes_price) + influence * 0.1 + drift + noise
-                new_p = max(0.02, min(0.98, new_p))
+                # Preço justo baseado no spot atual
+                p_fair = self._fair_price(m, spot)
+
+                # Ruído de mercado em torno do fair value (market maker spread + noise)
+                vol_noise = self.IMPL_VOL.get(m.symbol, 0.020) * 0.3
+                noise     = random.gauss(0, vol_noise)
+
+                # Mean-reversion suave para o fair price
+                current   = self._probs.get(m.token_id, p_fair)
+                reversion = (p_fair - current) * 0.15   # puxa 15% em direção ao fair
+                new_p     = current + reversion + noise
+                new_p     = max(0.03, min(0.97, new_p))
                 self._probs[m.token_id] = new_p
 
-                spread = random.uniform(0.01, 0.03)
-                bid    = max(0.01, new_p - spread / 2)
-                ask    = min(0.99, new_p + spread / 2)
+                spread = random.uniform(0.008, 0.025)
+                bid    = max(0.02, new_p - spread / 2)
+                ask    = min(0.98, new_p + spread / 2)
 
                 self.msg_count += 1
                 self.last_ts    = time.time()
