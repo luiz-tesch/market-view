@@ -39,6 +39,7 @@ SYMBOL_STREAMS: dict[str, str] = {
     "BNB":   "bnbusdt",
     "MATIC": "maticusdt",
     "DOGE":  "dogeusdt",
+    "XRP":   "xrpusdt",
 }
 STREAM_TO_SYM: dict[str, str] = {v: k for k, v in SYMBOL_STREAMS.items()}
 
@@ -81,7 +82,32 @@ class PolyMarket:
         except Exception:
             return 9999.0
 
+    def _horizon_from_title(self) -> float | None:
+        import re
+        q = self.question.lower()
+        if "up or down" not in q:
+            return None
+        # Formato: "8:30PM-8:35PM" → 5 minutos
+        m = re.search(r"(\d{1,2}):(\d{2})(am|pm)-(\d{1,2}):(\d{2})(am|pm)", q)
+        if m:
+            h1, m1, p1, h2, m2, p2 = m.groups()
+            h1, m1, h2, m2 = int(h1), int(m1), int(h2), int(m2)
+            if p1 == "pm" and h1 != 12: h1 += 12
+            if p2 == "pm" and h2 != 12: h2 += 12
+            diff = (h2 * 60 + m2) - (h1 * 60 + m1)
+            return float(diff) if diff > 0 else float(diff + 1440)
+        if "5 min"  in q: return 5.0
+        if "15 min" in q: return 15.0
+        if "30 min" in q: return 30.0
+        if "1 hour" in q or "60 min" in q: return 60.0
+        return None
+
     def is_short_term(self) -> bool:
+        # Mercados "Up or Down": horizonte real está no título, não no endDate
+        horizon = self._horizon_from_title()
+        if horizon is not None:
+            return SHORT_TERM_MIN_MINUTES <= horizon <= SHORT_TERM_MAX_MINUTES
+        # Outros mercados: usa mins_left() normalmente
         ml = self.mins_left()
         return SHORT_TERM_MIN_MINUTES <= ml <= SHORT_TERM_MAX_MINUTES
 
@@ -126,7 +152,7 @@ def fetch_gamma_markets(
             GAMMA_URL,
             params={
                 "active": "true", "closed": "false",
-                "limit": limit, "order": "volumeNum", "ascending": "false",
+                "limit": limit, "order": "startDate", "ascending": "false",
             },
             timeout=15,
         )
