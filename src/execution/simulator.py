@@ -42,6 +42,30 @@ from typing import Literal
 
 from src.signals.engine import PriceBuffer, compute_signal
 from src.feed.polymarket import fetch_market_resolution, POLYMARKET_FEE
+
+# Combined Strategy Engine: Arbitrage > Stale Snipe > Market Making > Quant
+try:
+    from src.signals.strategies import combined_decide
+    USE_COMBINED = True
+except ImportError:
+    USE_COMBINED = False
+    combined_decide = None
+
+# Quant Brain: modelo matemático (log-normal + OBI + multi-indicator gate) — fallback
+try:
+    from src.signals.quant_brain import quant_decide
+    USE_QUANT = True
+except ImportError:
+    USE_QUANT = False
+    quant_decide = None
+
+# Claude/LLM Brain: mantém como fallback opcional mas NÃO é o primário
+try:
+    from src.signals.claude_brain import claude_decide, ANTHROPIC_API_KEY as _CLAUDE_KEY
+    USE_CLAUDE = bool(_CLAUDE_KEY)
+except ImportError:
+    USE_CLAUDE = False
+    claude_decide = None
 from src.config import SHORT_TERM_MAX_MINUTES, SHORT_TERM_MIN_MINUTES
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -170,10 +194,10 @@ class TradingSimulator:
     MIN_BALANCE       = 5.0
     COOLDOWN_SECONDS  = 300
     ALLOWED_CONF      = {"medium", "high"}
-    # FIX BUG 2: alinhado com engine.py (era high=0.06, medium=0.11)
-    MIN_EDGE          = {"high": 0.05, "medium": 0.09}
-    MIN_TICKS         = 80
-    MIN_CANDLES       = 6
+    # v3.0: thresholds sobre fee_adjusted_edge (não edge bruto)
+    MIN_EDGE          = {"high": 0.035, "medium": 0.07}
+    MIN_TICKS         = 40
+    MIN_CANDLES       = 3
     WARMUP_SECONDS    = 30
 
     def __init__(self, price_buffers: dict[str, PriceBuffer], collector: "DataCollector | None" = None):
@@ -211,17 +235,23 @@ class TradingSimulator:
         end_date_iso: str = "",
         condition_id: str = "",
         market_type:  str = "price",
+        no_token_id:  str = "",
+        no_price:     float = 0.0,
     ):
         if not (SHORT_TERM_MIN_MINUTES <= horizon_min <= SHORT_TERM_MAX_MINUTES):
+            print(f"[Sim] register_market REJECTED {symbol} horizon={horizon_min} (range {SHORT_TERM_MIN_MINUTES}-{SHORT_TERM_MAX_MINUTES})")
             return
 
+        print(f"[Sim] register_market OK {symbol} horizon={horizon_min} token={token_id[:12]}")
         self._markets[token_id] = {
             "token_id":         token_id,
+            "no_token_id":      no_token_id,
             "question":         question,
             "slug":             slug,
             "symbol":           symbol,
             "horizon_min":      horizon_min,
             "yes_price":        yes_price,
+            "no_price":         no_price,
             "end_date_iso":     end_date_iso,
             "condition_id":     condition_id,
             "market_type":      market_type,
@@ -259,9 +289,11 @@ class TradingSimulator:
                 except Exception:
                     pass
 
+        print(f"[Sim] cleanup_expired_markets: before={len(self._markets)} removing={len(to_remove)} reasons={[self._markets.get(t,{}).get('end_date_iso','?')[:16] for t in to_remove[:3]]}")
         for tid in to_remove:
             del self._markets[tid]
 
+        print(f"[Sim] cleanup_expired_markets: after={len(self._markets)}")
         if to_remove:
             print(f"[Sim] Cleaned up {len(to_remove)} expired markets (remaining: {len(self._markets)})")
 
@@ -274,6 +306,7 @@ class TradingSimulator:
             if m.get("resolved"):
                 return
             m["yes_price"]   = mid
+            m["no_price"]    = 1.0 - mid  # Polymarket: YES + NO ≈ 1.0
             m["last_update"] = time.time()
             m["bid"]         = bid
             m["ask"]         = ask
@@ -343,6 +376,11 @@ class TradingSimulator:
         wu_rounded = round(wu, 0)
         self.stats.warmup_remaining = wu_rounded
 
+        n_markets = len(self._markets)
+        if n_markets == 0:
+            import traceback
+            print(f"[Sim] WARNING snapshot() called with 0 markets — id(self._markets)={id(self._markets)}")
+            traceback.print_stack(limit=4)
         return {
             "stats":                     self.stats.to_dict(),
             "open_trades":               ot,
@@ -358,9 +396,8 @@ class TradingSimulator:
             "pending_resolution_count":  len(pending_list),
             "pending_resolution_trades": pending_list,
             "expired_count":             self.stats.expired_count,
-            # FIX BUG 4: expõe skip reasons no snapshot para debug
             "skip_reasons":              dict(self._skip_reasons),
-            "registered_markets":        len(self._markets),
+            "registered_markets":        n_markets,
         }
 
     # ── Avaliação de entrada ───────────────────────────────────────────────────
@@ -394,41 +431,148 @@ class TradingSimulator:
             self.stats.signals_skipped += 1
             return
 
-        sig = compute_signal(
-            symbol=sym, buf=buf,
-            market_price_yes=mid, horizon_minutes=int(horiz),
-            question=mkt.get("question", ""),
-        )
+        # Calcula seconds_to_expiry para end-of-cycle sniping
+        seconds_to_expiry: float | None = None
+        end_iso = mkt.get("end_date_iso", "")
+        if end_iso:
+            try:
+                from datetime import datetime, timezone
+                end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                seconds_to_expiry = (end_dt - datetime.now(timezone.utc)).total_seconds()
+            except Exception:
+                pass
+
+        # Preferência por SOL e XRP (menor competição de bots HFT)
+        low_competition_syms = {"SOL", "XRP", "MATIC", "DOGE"}
+        competition_boost = sym in low_competition_syms
+
+        # ── Decisão: Combined Strategy Engine ──────────────────────────────
+        sig = None
+
+        # Prioridade 1: Combined Engine (Arb > Stale > MM > Quant Direction)
+        if USE_COMBINED and combined_decide:
+            sig = combined_decide(
+                symbol=sym, buf=buf,
+                market_price_yes=mid, horizon_minutes=int(horiz),
+                question=mkt.get("question", ""),
+                seconds_to_expiry=seconds_to_expiry,
+                bid=bid, ask=ask,
+                token_id=token_id,
+                no_token_id=mkt.get("no_token_id", ""),
+                condition_id=mkt.get("condition_id", ""),
+                no_price=mkt.get("no_price"),
+            )
+
+        # Combined engine already handles all strategies including quant direction
+        # (with end-of-cycle filter). No additional fallbacks needed —
+        # unchecked direction bets are the #1 source of losses.
+        if sig is None:
+            return
+
         self.stats.scans += 1
 
         if sig.direction == "SKIP":
             self.stats.signals_skipped += 1
-            self._track_skip(f"direction_skip(edge={sig.edge:.3f},conf={sig.confidence})")
+            self._track_skip(f"direction_skip(fee_adj_edge={sig.fee_adjusted_edge:.3f},conf={sig.confidence})")
             return
 
         if sig.confidence not in self.ALLOWED_CONF:
+            # Arbitrage is always high confidence — should never hit this
             self.stats.signals_skipped += 1
-            self._track_skip(f"confidence_low")
+            self._track_skip("confidence_low")
             return
 
-        if abs(sig.edge) < self.MIN_EDGE.get(sig.confidence, 0.15):
-            self.stats.signals_skipped += 1
-            self._track_skip(f"edge_too_low({sig.edge:.3f}<{self.MIN_EDGE.get(sig.confidence, 0.15)})")
-            return
+        # Usa fee_adjusted_edge para threshold
+        fee_adj = sig.fee_adjusted_edge
+        strategy = getattr(sig, 'strategy', 'UNKNOWN')
 
-        if sig.direction == "YES" and sig.momentum_1m < -0.10:
+        # Arbitrage e Stale Snipe já passaram por seus próprios filtros — confia
+        if strategy in ("ARBITRAGE", "STALE_SNIPE"):
+            min_edge_req = 0.003  # 0.3% mínimo (quase sempre passa)
+        elif strategy == "MARKET_MAKING":
+            min_edge_req = 0.005  # 0.5% mínimo
+        else:
+            min_edge_req = self.MIN_EDGE.get(sig.confidence, 0.15)
+            if competition_boost:
+                min_edge_req *= 0.80
+
+        if fee_adj < min_edge_req:
             self.stats.signals_skipped += 1
-            self._track_skip("momentum_conflict_YES")
-            self._log("SKIP", f"{sym} YES vs mom1m {sig.momentum_1m:+.2f}%")
-            return
-        if sig.direction == "NO" and sig.momentum_1m > 0.10:
-            self.stats.signals_skipped += 1
-            self._track_skip("momentum_conflict_NO")
-            self._log("SKIP", f"{sym} NO vs mom1m {sig.momentum_1m:+.2f}%")
+            self._track_skip(f"fee_adj_edge_low({fee_adj:.3f}<{min_edge_req:.3f})")
             return
 
         self.stats.signals_fired += 1
-        self._place_trade(mkt, sym, sig, horiz, bid, ask)
+
+        # Arbitrage: buy BOTH sides (guaranteed profit)
+        if strategy == "ARBITRAGE" and sig.direction == "BOTH":
+            self._place_arbitrage_trade(mkt, sym, sig, horiz, bid, ask)
+        else:
+            self._place_trade(mkt, sym, sig, horiz, bid, ask)
+
+    def _place_arbitrage_trade(self, mkt: dict, sym: str, sig, horiz: float, bid: float, ask: float):
+        """
+        Arbitrage: compra YES e NO ao mesmo tempo.
+        Um deles SEMPRE paga $1.00 na resolução → lucro = 1.00 - custo total.
+        Simulamos como BUY_YES com pnl pré-calculado (já que é lucro garantido).
+        """
+        arb = getattr(sig, 'arb_signal', None)
+        if not arb:
+            return
+
+        with self._lock:
+            if len(self.open_trades) >= self.MAX_OPEN_TRADES:
+                return
+
+            # Gross = custo total do par (YES + NO + fees)
+            max_sets = self.stats.balance * self.MAX_POSITION_PCT / arb.total_cost
+            num_sets = max(1, min(int(max_sets), 5))  # Max 5 sets por arb
+            gross = round(arb.total_cost * num_sets, 4)
+            payout = round(1.00 * num_sets, 4)  # guaranteed payout
+            expected_pnl = round(arb.profit_per_set * num_sets, 4)
+
+            if gross > self.stats.balance:
+                return
+
+            trade = Trade(
+                id                 = str(uuid.uuid4())[:8],
+                symbol             = sym,
+                question           = f"[ARB] {mkt['question'][:80]}",
+                slug               = mkt["slug"],
+                token_id           = mkt["token_id"],
+                condition_id       = mkt.get("condition_id", ""),
+                action             = "BUY_YES",  # represents the pair
+                amount_usdc        = gross,
+                gross_usdc         = gross,
+                fee_usdc           = round(gross - arb.total_cost * num_sets / (1 + arb.yes_fee + arb.no_fee) if arb.yes_fee + arb.no_fee > 0 else 0, 4),
+                entry_price        = arb.total_cost,  # cost per set
+                entry_ts           = time.time(),
+                horizon_min        = horiz,
+                end_date_iso       = mkt.get("end_date_iso", ""),
+                signal_edge        = arb.profit_pct / 100,
+                signal_confidence  = "high",
+                signal_reasons     = sig.reasons[:],
+                signal_momentum_1m = 0,
+                signal_momentum_5m = 0,
+                signal_rsi         = 50,
+                market_type        = "arbitrage",
+                current_price      = arb.total_cost,
+            )
+
+            self.stats.balance       -= gross
+            self.stats.total_trades  += 1
+            self.stats.total_wagered += gross
+            self.stats.total_fees    += trade.fee_usdc
+            self.stats.last_action_ts = time.time()
+            self.open_trades.append(trade)
+            self._cooldown[mkt["slug"]] = time.time()
+
+        self._log(
+            "ARB_OPEN",
+            f"ARBITRAGE {sym} sets={num_sets} cost=${gross:.4f} "
+            f"expected_pnl=${expected_pnl:.4f} ({arb.profit_pct:.2f}%) "
+            f"YES={arb.yes_price:.3f} NO={arb.no_price:.3f}",
+            level="info", trade_id=trade.id, symbol=sym,
+        )
 
     def _track_skip(self, reason: str):
         """FIX BUG 4: rastreia motivos de skip para debug."""
@@ -469,7 +613,10 @@ class TradingSimulator:
             gross    = max(gross, 0.10)
             gross    = min(gross, max_bet, self.stats.balance * 0.06)
 
-            fee    = round(gross * POLYMARKET_FEE, 4)
+            # Taxa dinâmica baseada no preço de entrada (não flat rate)
+            from src.signals.engine import polymarket_dynamic_fee
+            dynamic_fee_rate = polymarket_dynamic_fee(entry_price)
+            fee    = round(gross * dynamic_fee_rate, 4)
             amount = round(gross - fee, 4)
 
             if gross > self.stats.balance:

@@ -8,7 +8,12 @@ Correções v3.1:
 - Dashboard totalmente redesenhado: minimalista, profissional, painéis ocultáveis
 """
 from __future__ import annotations
-import json, queue, threading, time
+import sys, json, queue, threading, time
+# Força UTF-8 no stdout/stderr (necessário no Windows com cp1252)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from flask import Flask, Response, jsonify, render_template_string, request
 
 from src.signals.engine import PriceBuffer, compute_signal
@@ -58,6 +63,12 @@ def on_binance(sym: str, price: float, qty: float):
         except Exception:
             pass
     price_buffers[sym].push(price, qty)
+    # Trigger simulator evaluation for all markets of this symbol
+    for token_id, mkt in list(simulator._markets.items()):
+        if mkt.get("symbol") == sym and not mkt.get("resolved"):
+            bid = mkt.get("bid", mkt.get("yes_price", 0.5))
+            ask = mkt.get("ask", mkt.get("yes_price", 0.5))
+            simulator.on_price_update(token_id, bid, ask)
     _sse("tick", {"sym": sym, "price": price, "ts": time.time()})
 
 
@@ -125,6 +136,16 @@ def api_stats_edge():
 def api_snap():
     return jsonify(_snap())
 
+@app.route("/api/debug")
+def api_debug():
+    return jsonify({
+        "simulator_id": id(simulator),
+        "markets_id": id(simulator._markets),
+        "markets_count": len(simulator._markets),
+        "markets_keys": list(simulator._markets.keys())[:5],
+        "sim_running": simulator._running,
+    })
+
 @app.route("/api/sim/toggle", methods=["POST"])
 def sim_toggle():
     if simulator._running:
@@ -140,7 +161,14 @@ def sim_reset():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    threading.Thread(target=_load_markets, daemon=True).start()
+    def _safe_load():
+        try:
+            _load_markets()
+        except Exception as e:
+            import traceback
+            print(f"[App] ERRO em _load_markets: {e}")
+            traceback.print_exc()
+    threading.Thread(target=_safe_load, daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -157,12 +185,21 @@ def _snap() -> dict:
         }
         if p and len(buf.ticks) > 20:
             try:
-                sig = compute_signal(sym, buf, 0.5, 10)
-                signals[sym] = {
+                sig = None
+                # Try combined engine first
+                try:
+                    from src.signals.strategies import combined_decide, calculate_dynamic_vol
+                    sig = combined_decide(sym, buf, 0.5, 10, seconds_to_expiry=300)
+                except ImportError:
+                    pass
+                if sig is None:
+                    sig = compute_signal(sym, buf, 0.5, 10)
+                sig_dict = {
                     "direction":    sig.direction,
                     "strength":     round(sig.strength, 3),
                     "confidence":   sig.confidence,
                     "edge":         round(sig.edge, 4),
+                    "fee_adjusted_edge": round(getattr(sig, 'fee_adjusted_edge', 0), 4),
                     "momentum_1m":  round(sig.momentum_1m, 3),
                     "momentum_5m":  round(sig.momentum_5m, 3),
                     "rsi":          round(sig.rsi, 1),
@@ -171,11 +208,43 @@ def _snap() -> dict:
                     "reasons":      sig.reasons,
                     "market_type":  sig.market_type,
                 }
+                # Add strategy-specific fields
+                if hasattr(sig, 'strategy'):
+                    sig_dict["strategy"] = sig.strategy
+                    sig_dict["dynamic_vol"] = round(sig.dynamic_vol, 6)
+                if hasattr(sig, 'fair_prob'):
+                    sig_dict["fair_prob"] = round(sig.fair_prob, 4)
+                    sig_dict["obi"] = round(getattr(sig, 'obi', 0), 3)
+                    sig_dict["z_score"] = round(getattr(sig, 'z_score', 0), 3)
+                    sig_dict["indicators_agreeing"] = getattr(sig, 'indicators_agreeing', 0)
+                    sig_dict["is_end_of_cycle"] = getattr(sig, 'is_end_of_cycle', False)
+                signals[sym] = sig_dict
             except Exception:
                 pass
 
     lat  = clob_feed.avg_latency_ms() if clob_feed and hasattr(clob_feed, "avg_latency_ms") else 0.0
     msgs = clob_feed.msg_count if clob_feed and hasattr(clob_feed, "msg_count") else 0
+
+    # Brain info
+    brain_info = {"provider": "technical", "model": "indicators", "active": False}
+    try:
+        from src.signals.strategies import combined_decide
+        brain_info = {
+            "provider": "combined",
+            "model": "Arb + Stale + MM + Quant",
+            "active": True,
+        }
+    except ImportError:
+        try:
+            from src.signals.claude_brain import LLM_PROVIDER, LLM_AVAILABLE, GROQ_MODEL, GEMINI_MODEL
+            if LLM_AVAILABLE:
+                brain_info = {
+                    "provider": LLM_PROVIDER,
+                    "model": GROQ_MODEL if LLM_PROVIDER == "groq" else GEMINI_MODEL,
+                    "active": True,
+                }
+        except ImportError:
+            pass
 
     return {
         **sim,
@@ -183,6 +252,8 @@ def _snap() -> dict:
         "buffers":          bufinfo,
         "all_markets":      [m.to_dict() for m in all_markets],
         "short_markets":    [m.to_dict() for m in short_markets],
+        "upcoming_markets": [m.to_dict() for m in all_markets if m.is_upcoming()],
+        "brain":            brain_info,
         "feed": {
             "binance_live":  IS_LIVE_BIN,
             "clob_live":     IS_LIVE_CLOB,
@@ -190,6 +261,7 @@ def _snap() -> dict:
             "clob_msgs":     msgs,
             "total_markets": len(all_markets),
             "short_markets": len(short_markets),
+            "upcoming_markets": len([m for m in all_markets if m.is_upcoming()]),
         },
     }
 
@@ -200,7 +272,7 @@ def _load_markets():
     global all_markets, short_markets
 
     print("[App] Buscando mercados do Polymarket...")
-    markets = fetch_gamma_markets(limit=400, min_liquidity=50, max_days=90)
+    markets = fetch_gamma_markets(limit=500, min_liquidity=10, max_days=7)
 
     if not markets:
         print("[App] API indisponível — usando mercados demo")
@@ -210,27 +282,37 @@ def _load_markets():
 
     all_markets   = markets
     short_markets = [m for m in markets if m.is_short_term()]
-    print(f"[App] {len(all_markets)} mercados totais | {len(short_markets)} short-term")
+    upcoming      = [m for m in markets if m.is_upcoming()]
+    print(f"[App] {len(all_markets)} mercados totais | {len(short_markets)} short-term | {len(upcoming)} upcoming")
 
+    from src.signals.engine import detect_market_type
     for m in short_markets:
-      if m.symbol in price_buffers:
-          if collector:
-              try:
-                  collector.record_market(m)
-              except Exception:
-                  pass
-          from src.signals.engine import detect_market_type
-          simulator.register_market(
-              token_id     = m.token_id,
-              question     = m.question,
-              slug         = m.slug,
-              symbol       = m.symbol,
-              horizon_min  = max(3.0, m.mins_left()),
-              yes_price    = m.yes_price,
-              end_date_iso = m.end_date_iso,
-              condition_id = m.condition_id,
-              market_type  = detect_market_type(m.question),
-            )
+      if m.symbol not in price_buffers:
+          continue
+      if collector:
+          try:
+              collector.record_market(m)
+          except Exception:
+              pass
+      # Usa o horizonte real do título (5min/15min) — não mins_left() que retorna
+      # a data de expiração da campanha (ex: 1900min para mercados pré-listados)
+      h_title = m._horizon_from_title()
+      horizon_min = h_title if h_title is not None else max(3.0, m.mins_left())
+      if horizon_min is None or horizon_min <= 0:
+          continue
+      simulator.register_market(
+          token_id     = m.token_id,
+          question     = m.question,
+          slug         = m.slug,
+          symbol       = m.symbol,
+          horizon_min  = horizon_min,
+          yes_price    = m.yes_price,
+          end_date_iso = m.end_date_iso,
+          condition_id = m.condition_id,
+          market_type  = detect_market_type(m.question),
+          no_token_id  = m.no_token_id,
+          no_price     = m.no_price,
+      )
     simulator.cleanup_expired_markets()
     if clob_feed and isinstance(clob_feed, MockClobFeed):
         clob_feed.markets = markets
@@ -238,34 +320,47 @@ def _load_markets():
     _sse("markets_loaded", {"total": len(all_markets), "short": len(short_markets)})
 
 
+_demo_counter = 0
+
 def _demo() -> list[PolyMarket]:
+    global _demo_counter
     from datetime import datetime, timezone, timedelta
+    import random as _rnd
     now = datetime.now(timezone.utc)
+
+    # Gera mercados escalonados para resolver em 5-15min, gerando trades rápido
     demos = [
-        ("Will BTC be above $90,000 in 45 min?",         "BTC", 0.38, now + timedelta(minutes=45)),
-        ("Will BTC be above $85,000 in the next hour?",   "BTC", 0.55, now + timedelta(hours=1)),
-        ("Will ETH be above $3,200 in the next 30 min?",  "ETH", 0.47, now + timedelta(minutes=30)),
-        ("Will ETH stay above $3,000 for 2 hours?",       "ETH", 0.62, now + timedelta(hours=2)),
-        ("Will SOL hit $150 in the next hour?",            "SOL", 0.31, now + timedelta(minutes=55)),
-        ("Will BTC drop below $80,000 today?",             "BTC", 0.22, now + timedelta(hours=90)),
-        ("Will BNB reach $600 in 2 hours?",                "BNB", 0.18, now + timedelta(hours=2)),
-        ("Will BTC close above $85k in 20 minutes?",       "BTC", 0.41, now + timedelta(minutes=20)),
+        ("Will BTC be above $84,000 in 5 min?",    "BTC", 5),
+        ("Will BTC be above $85,000 in 10 min?",   "BTC", 10),
+        ("Will ETH be above $2,100 in 5 min?",     "ETH", 5),
+        ("Will ETH be above $2,200 in 10 min?",    "ETH", 8),
+        ("Will SOL hit $130 in 5 min?",             "SOL", 5),
+        ("Will SOL hit $135 in 10 min?",            "SOL", 10),
+        ("Will BNB reach $600 in 5 min?",           "BNB", 6),
+        ("Will DOGE hit $0.18 in 5 min?",           "DOGE", 5),
+        ("Will XRP hit $2.50 in 5 min?",            "XRP", 7),
+        ("Will BTC be above $83,000 in 15 min?",   "BTC", 15),
+        ("Will ETH stay above $2,000 for 10 min?",  "ETH", 12),
+        ("Will SOL be above $125 in 8 min?",        "SOL", 8),
     ]
     result = []
-    for i, (q, sym, p, end) in enumerate(demos):
+    for i, (q, sym, mins) in enumerate(demos):
+        idx = _demo_counter * 100 + i
+        p = round(0.25 + _rnd.random() * 0.50, 2)  # price entre 0.25-0.75
         result.append(PolyMarket(
-            token_id     = f"demo_yes_{i:04d}",
-            no_token_id  = f"demo_no_{i:04d}",
-            condition_id = f"demo_cid_{i:04d}",
+            token_id     = f"demo_yes_{idx:06d}",
+            no_token_id  = f"demo_no_{idx:06d}",
+            condition_id = f"demo_cid_{idx:06d}",
             question     = q,
-            slug         = f"demo-{i}",
+            slug         = f"demo-{idx}",
             symbol       = sym,
-            end_date_iso = end.isoformat().replace("+00:00", "Z"),
+            end_date_iso = (now + timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             yes_price    = p,
             no_price     = 1 - p,
             volume       = 50000 + i * 15000,
             liquidity    = 5000 + i * 2000,
         ))
+    _demo_counter += 1
     return result
 
 
@@ -274,7 +369,27 @@ def _demo() -> list[PolyMarket]:
 def startup():
     global binance_feed, clob_feed, IS_LIVE_BIN, IS_LIVE_CLOB
 
-    _load_markets()
+    # Mostra qual cérebro está sendo usado
+    try:
+        from src.signals.quant_brain import USE_QUANT
+        if True:  # quant_brain importou com sucesso
+            print("[App] CEREBRO: Quant Brain (log-normal + OBI + multi-indicator gate)")
+    except ImportError:
+        try:
+            from src.signals.claude_brain import LLM_PROVIDER, LLM_AVAILABLE
+            if LLM_AVAILABLE:
+                print(f"[App] CEREBRO: LLM ({LLM_PROVIDER}) — fallback")
+            else:
+                print("[App] CEREBRO: Indicadores Tecnicos")
+        except ImportError:
+            print("[App] CEREBRO: Indicadores Tecnicos")
+
+    try:
+        _load_markets()
+    except Exception as e:
+        import traceback
+        print(f"[App] ERRO CRITICO em _load_markets: {e}")
+        traceback.print_exc()
     time.sleep(0.3)
 
     try:
@@ -328,7 +443,9 @@ def startup():
 
     def market_refresher():
         while True:
-            time.sleep(300)
+            # Refresh adaptativo: 60s se sem mercados ativos, 300s se tem
+            interval = 60 if not short_markets else 300
+            time.sleep(interval)
             try:
                 _load_markets()
             except Exception as e:
@@ -358,16 +475,16 @@ DASHBOARD = r"""<!DOCTYPE html>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
-  --bg:        #080a0e;
-  --s1:        #0d1017;
-  --s2:        #111520;
-  --s3:        #161b26;
-  --border:    #1e2535;
-  --border2:   #252d3d;
-  --text:      #4a5568;
+  --bg:        #06080c;
+  --s1:        #0b0e14;
+  --s2:        #10141c;
+  --s3:        #151a24;
+  --border:    #1a2030;
+  --border2:   #222a3a;
+  --text:      #3e4d63;
   --text2:     #6b7a95;
   --text3:     #8fa3bf;
-  --hi:        #c8daf0;
+  --hi:        #d0e0f5;
   --green:     #00e87a;
   --green2:    rgba(0,232,122,.06);
   --green3:    rgba(0,232,122,.15);
@@ -379,9 +496,11 @@ DASHBOARD = r"""<!DOCTYPE html>
   --amber2:    rgba(255,181,71,.07);
   --purple:    #a78bfa;
   --purple2:   rgba(167,139,250,.07);
+  --cyan:      #22d3ee;
+  --cyan2:     rgba(34,211,238,.07);
   --mono:      'IBM Plex Mono', monospace;
   --sans:      'IBM Plex Sans', sans-serif;
-  --r:         6px;
+  --r:         8px;
 }
 html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text2); font-family: var(--sans); font-size: 13px; line-height: 1.5; }
 
@@ -391,8 +510,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 
 /* layout */
-.root { display: grid; grid-template-rows: 52px 1fr; height: 100vh; }
-.body { display: grid; grid-template-columns: 220px 1fr 280px; height: 100%; overflow: hidden; min-height: 0; }
+.root { display: grid; grid-template-rows: 56px 1fr; height: 100vh; }
+.body { display: grid; grid-template-columns: 240px 1fr 300px; height: 100%; overflow: hidden; min-height: 0; }
 .col  { display: flex; flex-direction: column; border-right: 1px solid var(--border); min-height: 0; overflow: hidden; }
 .col:last-child { border-right: none; }
 .col.hidden { width: 0 !important; overflow: hidden; border: none; }
@@ -400,13 +519,16 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 /* topbar */
 .topbar {
-  display: flex; align-items: center; gap: 10px; padding: 0 16px;
-  background: var(--s1); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px; padding: 0 20px;
+  background: linear-gradient(180deg, var(--s1) 0%, var(--bg) 100%);
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 .brand {
-  font-family: var(--mono); font-size: 11px; font-weight: 600;
-  color: var(--hi); letter-spacing: .18em;
+  font-family: var(--mono); font-size: 12px; font-weight: 600;
+  color: var(--hi); letter-spacing: .2em;
+  background: linear-gradient(135deg, var(--green) 0%, var(--cyan) 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
 }
 .sep { width: 1px; height: 20px; background: var(--border2); margin: 0 2px; }
 
@@ -429,24 +551,25 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 /* metric chips in topbar */
 .metric {
   display: flex; flex-direction: column; align-items: flex-end;
-  padding: 4px 10px; border-radius: var(--r);
+  padding: 6px 12px; border-radius: var(--r);
   border: 1px solid var(--border); background: var(--s2);
-  min-width: 72px;
+  min-width: 78px; transition: border-color .2s;
 }
-.metric-l { font-size: 9px; color: var(--text); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 1px; }
-.metric-v { font-family: var(--mono); font-size: 14px; font-weight: 500; line-height: 1; color: var(--hi); }
-.metric-v.up  { color: var(--green); }
-.metric-v.dn  { color: var(--red); }
+.metric:hover { border-color: var(--border2); }
+.metric-l { font-size: 9px; color: var(--text); letter-spacing: .12em; text-transform: uppercase; margin-bottom: 2px; }
+.metric-v { font-family: var(--mono); font-size: 15px; font-weight: 600; line-height: 1; color: var(--hi); }
+.metric-v.up  { color: var(--green); text-shadow: 0 0 20px rgba(0,232,122,.2); }
+.metric-v.dn  { color: var(--red); text-shadow: 0 0 20px rgba(255,77,106,.2); }
 .metric-v.neu { color: var(--blue); }
 
 .topbar-actions { display: flex; gap: 5px; margin-left: 6px; }
 .btn {
   font-family: var(--mono); font-size: 9px; letter-spacing: .1em; text-transform: uppercase;
-  padding: 6px 14px; border-radius: var(--r); cursor: pointer; border: 1px solid;
-  background: transparent; transition: all .15s; font-weight: 500;
+  padding: 7px 16px; border-radius: var(--r); cursor: pointer; border: 1px solid;
+  background: transparent; transition: all .2s; font-weight: 600;
 }
 .btn-run  { border-color: rgba(0,232,122,.3); color: var(--green); }
-.btn-run:hover  { background: var(--green2); border-color: rgba(0,232,122,.5); }
+.btn-run:hover  { background: var(--green2); border-color: rgba(0,232,122,.5); box-shadow: 0 0 12px rgba(0,232,122,.1); }
 .btn-stop { border-color: rgba(255,77,106,.3); color: var(--red); }
 .btn-stop:hover { background: var(--red2); }
 .btn-ghost { border-color: var(--border2); color: var(--text2); }
@@ -464,9 +587,10 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 /* col headers */
 .col-head {
-  font-family: var(--mono); font-size: 9px; font-weight: 600; letter-spacing: .16em;
-  color: var(--text); padding: 10px 14px; border-bottom: 1px solid var(--border);
-  background: var(--s1); flex-shrink: 0; display: flex; align-items: center;
+  font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: .16em;
+  color: var(--text3); padding: 12px 16px; border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--s1) 0%, var(--bg) 100%);
+  flex-shrink: 0; display: flex; align-items: center;
   justify-content: space-between; text-transform: uppercase;
 }
 .col-head-val { font-size: 9px; color: var(--text2); font-weight: 400; letter-spacing: 0; font-family: var(--sans); }
@@ -496,103 +620,111 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .debug-sep { color: var(--border2); }
 /* ── STATUS BAR (nova — mostra o estado do aquecimento) ────────── */
 .status-bar {
-  padding: 5px 14px; background: var(--s1); border-bottom: 1px solid var(--border);
+  padding: 8px 16px; background: var(--s1); border-bottom: 1px solid var(--border);
   font-family: var(--mono); font-size: 9px; color: var(--text);
-  flex-shrink: 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  flex-shrink: 0; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
 }
-.sb-item { display: flex; align-items: center; gap: 4px; }
-.sb-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--border2); flex-shrink: 0; }
-.sb-dot.ok  { background: var(--green); }
-.sb-dot.warn{ background: var(--amber); }
-.sb-dot.bad { background: var(--red); }
+.sb-item { display: flex; align-items: center; gap: 5px; padding: 2px 6px; border-radius: 4px; background: var(--s2); }
+.sb-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--border2); flex-shrink: 0; transition: all .3s; }
+.sb-dot.ok  { background: var(--green); box-shadow: 0 0 6px rgba(0,232,122,.3); }
+.sb-dot.warn{ background: var(--amber); box-shadow: 0 0 6px rgba(255,181,71,.3); }
+.sb-dot.bad { background: var(--red); box-shadow: 0 0 6px rgba(255,77,106,.3); }
 .sb-label { color: var(--text); }
-.sb-val   { color: var(--text3); }
+.sb-val   { color: var(--text3); font-weight: 500; }
 
 /* stat grid */
 .stat-grid {
   display: grid; grid-template-columns: repeat(3, 1fr);
   border-bottom: 1px solid var(--border); flex-shrink: 0;
+  gap: 1px; background: var(--border);
 }
-.stat { padding: 12px 14px; border-right: 1px solid var(--border); position: relative; }
-.stat:last-child { border-right: none; }
-.stat:nth-child(3) { border-right: none; }
-.stat-accent { position: absolute; top: 0; left: 0; right: 0; height: 2px; border-radius: 0 0 2px 2px; }
-.a-g { background: linear-gradient(90deg, var(--green), transparent); }
-.a-b { background: linear-gradient(90deg, var(--blue), transparent); }
-.a-a { background: linear-gradient(90deg, var(--amber), transparent); }
-.a-r { background: linear-gradient(90deg, var(--red), transparent); }
-.a-p { background: linear-gradient(90deg, var(--purple), transparent); }
-.a-d { background: linear-gradient(90deg, var(--border2), transparent); }
-.stat-l { font-size: 9px; letter-spacing: .12em; color: var(--text); text-transform: uppercase; margin-bottom: 4px; }
-.stat-v { font-family: var(--mono); font-size: 20px; font-weight: 500; line-height: 1; color: var(--hi); }
-.stat-sub { font-size: 10px; color: var(--text2); margin-top: 3px; font-family: var(--mono); }
+.stat {
+  padding: 16px 16px; position: relative; background: var(--bg);
+  transition: background .15s;
+}
+.stat:hover { background: var(--s2); }
+.stat-accent { position: absolute; top: 0; left: 0; right: 0; height: 2px; }
+.a-g { background: linear-gradient(90deg, var(--green), transparent 80%); }
+.a-b { background: linear-gradient(90deg, var(--blue), transparent 80%); }
+.a-a { background: linear-gradient(90deg, var(--amber), transparent 80%); }
+.a-r { background: linear-gradient(90deg, var(--red), transparent 80%); }
+.a-p { background: linear-gradient(90deg, var(--purple), transparent 80%); }
+.a-d { background: linear-gradient(90deg, var(--border2), transparent 80%); }
+.stat-l { font-size: 9px; letter-spacing: .14em; color: var(--text); text-transform: uppercase; margin-bottom: 6px; font-weight: 500; }
+.stat-v { font-family: var(--mono); font-size: 22px; font-weight: 600; line-height: 1; color: var(--hi); }
+.stat-sub { font-size: 10px; color: var(--text2); margin-top: 5px; font-family: var(--mono); }
 
 /* equity */
-.eq-wrap { padding: 12px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-.eq-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-.eq-title { font-size: 9px; letter-spacing: .12em; color: var(--text); text-transform: uppercase; font-family: var(--mono); }
-.eq-sub   { font-family: var(--mono); font-size: 9px; color: var(--text2); }
+.eq-wrap {
+  padding: 16px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  background: linear-gradient(180deg, var(--s2) 0%, var(--bg) 100%);
+}
+.eq-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.eq-title { font-size: 10px; letter-spacing: .14em; color: var(--text3); text-transform: uppercase; font-family: var(--mono); font-weight: 500; }
+.eq-sub   { font-family: var(--mono); font-size: 10px; color: var(--text2); }
 
 /* trades */
 .pos-head {
-  font-family: var(--mono); font-size: 9px; font-weight: 600; letter-spacing: .16em; color: var(--text);
-  text-transform: uppercase; padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: .16em; color: var(--text3);
+  text-transform: uppercase; padding: 12px 16px; border-bottom: 1px solid var(--border);
   background: var(--s1); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center;
 }
 .pos-cnt { color: var(--blue); font-size: 9px; }
 
 .trade-card {
-  padding: 10px 12px; border-bottom: 1px solid var(--border);
-  border-left: 2px solid transparent; transition: background .1s;
+  padding: 12px 14px; margin: 4px 8px; border-radius: var(--r);
+  border-left: 3px solid transparent; transition: all .15s;
+  background: var(--s2);
 }
-.trade-card:hover { background: rgba(255,255,255,.01); }
-.trade-card.yes  { border-left-color: var(--green); }
-.trade-card.no   { border-left-color: var(--red); }
-.trade-card.win  { border-left-color: var(--green); opacity: .45; }
-.trade-card.loss { border-left-color: var(--red);   opacity: .4; }
-.t-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 3px; }
-.t-sym { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--hi); }
-.t-pnl { font-family: var(--mono); font-size: 11px; font-weight: 500; }
-.t-q   { font-size: 11px; color: var(--text3); line-height: 1.4; margin-bottom: 6px; }
-.t-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+.trade-card:hover { background: var(--s3); transform: translateX(2px); }
+.trade-card.yes  { border-left-color: var(--green); background: linear-gradient(90deg, rgba(0,232,122,.03) 0%, var(--s2) 30%); }
+.trade-card.no   { border-left-color: var(--red); background: linear-gradient(90deg, rgba(255,77,106,.03) 0%, var(--s2) 30%); }
+.trade-card.win  { border-left-color: var(--green); opacity: .5; }
+.trade-card.loss { border-left-color: var(--red);   opacity: .45; }
+.t-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+.t-sym { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--hi); }
+.t-pnl { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.t-q   { font-size: 11px; color: var(--text3); line-height: 1.4; margin-bottom: 8px; }
+.t-tags { display: flex; gap: 5px; flex-wrap: wrap; }
 .tag {
-  font-family: var(--mono); font-size: 9px; padding: 2px 6px;
-  border-radius: 3px; border: 1px solid; letter-spacing: .04em;
+  font-family: var(--mono); font-size: 9px; padding: 3px 8px;
+  border-radius: 4px; border: 1px solid; letter-spacing: .04em;
 }
-.tag-yes  { background: var(--green2); color: var(--green); border-color: rgba(0,232,122,.2); }
-.tag-no   { background: var(--red2);   color: var(--red);   border-color: rgba(255,77,106,.2); }
-.tag-open { background: var(--blue2);  color: var(--blue);  border-color: rgba(61,158,255,.2); }
+.tag-yes  { background: var(--green2); color: var(--green); border-color: rgba(0,232,122,.25); }
+.tag-no   { background: var(--red2);   color: var(--red);   border-color: rgba(255,77,106,.25); }
+.tag-open { background: var(--blue2);  color: var(--blue);  border-color: rgba(61,158,255,.25); }
 .tag-cls  { background: transparent; color: var(--text2); border-color: var(--border2); }
 .tag-n    { background: transparent; color: var(--text2); border-color: var(--border); }
-.tag-fee  { background: var(--amber2); color: var(--amber); border-color: rgba(255,181,71,.2); }
-.prog     { height: 2px; background: var(--border); margin-top: 7px; overflow: hidden; border-radius: 1px; }
-.prog-f   { height: 100%; background: rgba(61,158,255,.4); transition: width 1s linear; }
+.tag-fee  { background: var(--amber2); color: var(--amber); border-color: rgba(255,181,71,.25); }
+.t-reason { font-size: 10px; color: var(--purple); margin-top: 6px; font-style: italic; line-height: 1.4; padding: 4px 8px; background: var(--purple2); border-radius: 4px; border-left: 2px solid rgba(167,139,250,.3); }
+.prog     { height: 3px; background: var(--border); margin-top: 8px; overflow: hidden; border-radius: 2px; }
+.prog-f   { height: 100%; background: linear-gradient(90deg, rgba(61,158,255,.6), rgba(61,158,255,.3)); transition: width 1s linear; border-radius: 2px; }
 
 /* signal blocks */
 .sig-block {
-  padding: 11px 13px; border-bottom: 1px solid var(--border);
-  transition: background .1s; cursor: default;
+  padding: 12px 14px; margin: 3px 6px; border-radius: var(--r);
+  transition: all .15s; cursor: default; background: var(--s2);
 }
-.sig-block:hover { background: rgba(255,255,255,.01); }
+.sig-block:hover { background: var(--s3); }
 .sig-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
 .sig-sym  { font-family: var(--mono); font-size: 15px; font-weight: 600; color: var(--hi); }
-.sig-price{ font-family: var(--mono); font-size: 13px; color: var(--blue); }
-.spark-wrap { height: 28px; margin-bottom: 7px; }
-canvas.spark { width: 100%; height: 28px; display: block; }
+.sig-price{ font-family: var(--mono); font-size: 13px; color: var(--blue); font-weight: 500; }
+.spark-wrap { height: 30px; margin-bottom: 7px; }
+canvas.spark { width: 100%; height: 30px; display: block; }
 .sig-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 7px; }
 .chip {
   font-family: var(--mono); font-size: 9px; font-weight: 500; letter-spacing: .06em;
-  padding: 3px 7px; border-radius: 3px; border: 1px solid;
+  padding: 3px 8px; border-radius: 4px; border: 1px solid;
 }
-.chip-yes  { background: var(--green2); color: var(--green); border-color: rgba(0,232,122,.2); }
-.chip-no   { background: var(--red2);   color: var(--red);   border-color: rgba(255,77,106,.2); }
+.chip-yes  { background: var(--green2); color: var(--green); border-color: rgba(0,232,122,.25); }
+.chip-no   { background: var(--red2);   color: var(--red);   border-color: rgba(255,77,106,.25); }
 .chip-skip { background: transparent;   color: var(--text2); border-color: var(--border); }
-.chip-hi   { background: var(--blue2);  color: var(--blue);  border-color: rgba(61,158,255,.2); }
-.chip-med  { background: var(--amber2); color: var(--amber); border-color: rgba(255,181,71,.2); }
+.chip-hi   { background: var(--blue2);  color: var(--blue);  border-color: rgba(61,158,255,.25); }
+.chip-med  { background: var(--amber2); color: var(--amber); border-color: rgba(255,181,71,.25); }
 .chip-lo   { background: transparent;   color: var(--text);  border-color: var(--border); }
-.chip-edge { background: var(--purple2);color: var(--purple);border-color: rgba(167,139,250,.2); }
-.sig-inds { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; }
-.ind { padding: 5px 7px; background: var(--s2); border-radius: 4px; border: 1px solid var(--border); }
+.chip-edge { background: var(--purple2);color: var(--purple);border-color: rgba(167,139,250,.25); }
+.sig-inds { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.ind { padding: 6px 8px; background: var(--bg); border-radius: 5px; border: 1px solid var(--border); }
 .ind-l { font-size: 8px; color: var(--text); letter-spacing: .1em; text-transform: uppercase; margin-bottom: 2px; }
 .ind-v { font-family: var(--mono); font-size: 11px; font-weight: 500; color: var(--hi); }
 .up  { color: var(--green) !important; }
@@ -641,28 +773,28 @@ canvas.spark { width: 100%; height: 28px; display: block; }
 .log-wrap { padding: 4px 0; }
 .log-e {
   font-family: var(--mono); font-size: 10px; line-height: 1.6;
-  padding: 5px 14px; border-left: 2px solid transparent;
-  transition: background .1s;
+  padding: 6px 14px; border-left: 3px solid transparent;
+  transition: background .1s; margin: 1px 4px; border-radius: 0 4px 4px 0;
 }
 .log-e:hover { background: var(--s2); }
-.le-open  { border-left-color: var(--blue); }
-.le-win   { border-left-color: var(--green); background: rgba(0,232,122,.02); }
-.le-loss  { border-left-color: var(--red);   background: rgba(255,77,106,.02); }
-.le-start { border-left-color: var(--amber); }
-.le-skip  { border-left-color: transparent; opacity: .35; }
-.le-real  { border-left-color: var(--purple); }
+.le-open  { border-left-color: var(--blue); background: rgba(61,158,255,.02); }
+.le-win   { border-left-color: var(--green); background: rgba(0,232,122,.03); }
+.le-loss  { border-left-color: var(--red);   background: rgba(255,77,106,.03); }
+.le-start { border-left-color: var(--amber); background: rgba(255,181,71,.02); }
+.le-skip  { border-left-color: transparent; opacity: .3; }
+.le-real  { border-left-color: var(--purple); background: rgba(167,139,250,.02); }
 .le-pend  { border-left-color: var(--amber); background: rgba(255,181,71,.02); }
 .le-debug { border-left-color: var(--blue); opacity: .5; background: rgba(61,158,255,.02); }
-.le-ts  { color: var(--text); margin-right: 6px; }
-.le-ev  { font-weight: 600; margin-right: 6px; color: var(--text3); font-size: 9px; letter-spacing: .06em; }
+.le-ts  { color: var(--text); margin-right: 8px; }
+.le-ev  { font-weight: 600; margin-right: 8px; color: var(--text3); font-size: 9px; letter-spacing: .06em; }
 .le-msg { color: var(--text2); }
 
 /* empty */
 .empty {
-  padding: 32px 16px; text-align: center; color: var(--text);
-  font-size: 10px; letter-spacing: .06em; line-height: 2.6;
+  padding: 48px 20px; text-align: center; color: var(--text);
+  font-size: 11px; letter-spacing: .06em; line-height: 2.4;
 }
-.empty-icon { font-size: 20px; display: block; margin-bottom: 8px; opacity: .3; }
+.empty-icon { font-size: 24px; display: block; margin-bottom: 12px; opacity: .2; }
 
 /* pending badge */
 .pending-bar {
@@ -694,6 +826,7 @@ canvas.spark { width: 100%; height: 28px; display: block; }
   <span class="dot live" id="status-dot"></span>
   <span class="brand">ALPHA-GUY</span>
   <div class="sep"></div>
+  <span class="badge badge-blue" id="pill-brain">BRAIN: —</span>
   <span class="badge badge-amber" id="pill-bin">BIN MOCK</span>
   <span class="badge badge-amber" id="pill-clob">CLOB MOCK</span>
   <span class="badge badge-purple" id="pill-short" style="display:none">0 SHORT</span>
@@ -950,6 +1083,17 @@ function apply(d) {
   const lat = d.feed?.clob_lat_ms ?? 0;
   set('n-lat', lat > 0 ? lat.toFixed(1) + 'ms' : '—',
       lat < 30 ? 'var(--green)' : lat < 100 ? 'var(--amber)' : 'var(--red)');
+
+  // brain badge
+  const brain = d.brain || {};
+  const brainPill = document.getElementById('pill-brain');
+  if (brain.active) {
+    brainPill.textContent = brain.provider.toUpperCase() + ' AI';
+    brainPill.className = 'badge badge-green';
+  } else {
+    brainPill.textContent = 'TECHNICAL';
+    brainPill.className = 'badge badge-amber';
+  }
 
   // badges
   const binLive = d.feed?.binance_live, clobLive = d.feed?.clob_live;
@@ -1309,6 +1453,7 @@ function renderTrades(open, closed) {
         <span class="tag tag-n">${(t.entry_price * 100).toFixed(1)}¢</span>
         <span class="tag tag-n">e${(t.signal_edge * 100).toFixed(1)}%</span>
       </div>
+      ${t.signal_reasons?.length ? `<div class="t-reason">${t.signal_reasons.join('; ')}</div>` : ''}
       ${isOpen ? `<div class="prog"><div class="prog-f" style="width:${prog.toFixed(0)}%"></div></div>` : ''}
     </div>`;
   }
@@ -1395,7 +1540,7 @@ async function refreshMkts() { set('cnt-s','…','var(--amber)'); await fetch('/
 if __name__ == "__main__":
     print("=" * 60)
     print("  Polymarket Paper Bot v3.1")
-    print(f"  Short-term markets: 3–120 minutes")
-    print("  Dashboard → http://localhost:5001")
+    print("  Short-term markets: 3-120 minutes")
+    print("  Dashboard: http://localhost:5001")
     print("=" * 60)
     app.run(debug=False, port=5001, threaded=True)

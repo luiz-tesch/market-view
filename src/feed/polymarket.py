@@ -2,7 +2,7 @@
 src/feed/polymarket.py  v2.3
 Correções v2.3:
 - fetch_gamma_markets: logging detalhado de cada filtro descartado
-- Filtros muito menos restritivos (min_liquidity padrão: 10 → era 50)
+- Filtros muito menos restritivos (min_liquidity padrão: 10 -> era 50)
 - Aceita campo 'liquidity' além de 'liquidityNum' (API pode ter renomeado)
 - Aceita campo 'volume' além de 'volumeNum'
 - endDate fallback mais robusto — aceita formatos variados da API
@@ -51,7 +51,7 @@ CRYPTO_KEYWORDS: dict[str, list[str]] = {
     "XRP":   ["ripple", "xrp"],
 }
 
-POLYMARKET_FEE = 0.01   # 1% taxa maker/taker
+POLYMARKET_FEE = 0.0315  # Taxa taker máxima (em mercados near-50%); dinâmica na engine
 
 
 # ── Dataclass ──────────────────────────────────────────────────────────────────
@@ -101,10 +101,26 @@ class PolyMarket:
 
     def is_short_term(self) -> bool:
         horizon = self._horizon_from_title()
-        if horizon is not None:
-            return SHORT_TERM_MIN_MINUTES <= horizon <= SHORT_TERM_MAX_MINUTES
         ml = self.mins_left()
+        if horizon is not None:
+            # Horizonte do título precisa estar na faixa certa
+            if not (SHORT_TERM_MIN_MINUTES <= horizon <= SHORT_TERM_MAX_MINUTES):
+                return False
+            # Aceita se expira dentro de SHORT_TERM_MAX_MINUTES (120min)
+            # Isso permite registrar mercados de 5min que expiram em até 2h
+            return ml <= SHORT_TERM_MAX_MINUTES
         return SHORT_TERM_MIN_MINUTES <= ml <= SHORT_TERM_MAX_MINUTES
+
+    def is_upcoming(self, max_hours: float = 24.0) -> bool:
+        """Mercado curto prazo que ainda não está ativo mas começa em breve."""
+        horizon = self._horizon_from_title()
+        if horizon is None:
+            return False
+        if not (SHORT_TERM_MIN_MINUTES <= horizon <= SHORT_TERM_MAX_MINUTES):
+            return False
+        ml = self.mins_left()
+        # Não é short-term agora, mas expira dentro de max_hours
+        return SHORT_TERM_MAX_MINUTES < ml <= max_hours * 60
 
     def to_dict(self) -> dict:
         ml = self.mins_left()
@@ -118,6 +134,7 @@ class PolyMarket:
             "end_date_iso": self.end_date_iso,
             "mins_left":    round(ml, 1),
             "is_short":     self.is_short_term(),
+            "is_upcoming":  self.is_upcoming(),
             "yes_price":    round(self.yes_price, 4),
             "no_price":     round(self.no_price, 4),
             "volume":       round(self.volume, 2),
@@ -139,18 +156,20 @@ def _detect_symbol(question: str) -> str | None:
 def _parse_end_date(m: dict) -> str | None:
     """
     Tenta extrair end_date do mercado em vários formatos que a API pode usar.
-    Retorna ISO string ou None se não encontrar.
+    Prioriza campos com timestamp completo (contendo 'T') sobre campos só com data.
     """
-    # Tenta campos em ordem de preferência
-    for field in ("endDateIso", "endDate", "end_date_iso", "end_date", "expirationDate"):
-        v = m.get(field)
-        if v and isinstance(v, str) and len(v) >= 8:
-            # Normaliza para ISO
-            if "T" not in v:
-                v = v + "T23:59:00Z"
+    # Primeiro: campos com timestamp completo (contém 'T')
+    for fld in ("endDate", "endDateIso", "end_date_iso", "end_date", "expirationDate"):
+        v = m.get(fld)
+        if v and isinstance(v, str) and "T" in v and len(v) >= 16:
             if not v.endswith("Z") and "+" not in v:
                 v = v + "Z"
             return v
+    # Fallback: campos só com data (sem horário)
+    for fld in ("endDateIso", "endDate", "end_date_iso", "end_date", "expirationDate"):
+        v = m.get(fld)
+        if v and isinstance(v, str) and len(v) >= 8 and "T" not in v:
+            return v + "T23:59:00Z"
     return None
 
 
@@ -178,43 +197,15 @@ def _parse_volume(m: dict) -> float:
     return 0.0
 
 
-def fetch_gamma_markets(
-    limit: int = 300,
-    min_liquidity: float = 10.0,   # era 50 — reduzido para não filtrar tudo
-    max_days: float = 90.0,
-    _debug: bool = True,           # loga quantos caem em cada filtro
+def _process_raw_items(
+    items: list[dict],
+    min_liquidity: float,
+    max_days: float,
+    counts: dict,
+    seen_tokens: set[str],
 ) -> list[PolyMarket]:
-    """Busca mercados cripto ativos. Retorna lista ordenada por volume."""
-
-    # Contadores para debug
-    counts = {
-        "total_raw":     0,
-        "no_symbol":     0,
-        "no_token_ids":  0,
-        "no_end_date":   0,
-        "expired":       0,
-        "too_far":       0,
-        "low_liquidity": 0,
-        "accepted":      0,
-    }
-
-    try:
-        r = requests.get(
-            GAMMA_URL,
-            params={
-                "active": "true", "closed": "false",
-                "limit": limit, "order": "startDate", "ascending": "false",
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        raw   = r.json()
-        items = raw if isinstance(raw, list) else raw.get("data", [])
-    except Exception as e:
-        print(f"[Gamma] Fetch error: {e}")
-        return []
-
-    counts["total_raw"] = len(items)
+    """Processa itens crus da API e retorna PolyMarkets válidos."""
+    from datetime import datetime, timezone
     result: list[PolyMarket] = []
 
     for m in items:
@@ -235,6 +226,11 @@ def fetch_gamma_markets(
             counts["no_token_ids"] += 1
             continue
 
+        # Deduplica por token_id
+        if tids[0] in seen_tokens:
+            continue
+        seen_tokens.add(tids[0])
+
         # End date
         end_iso = _parse_end_date(m)
         if not end_iso:
@@ -243,7 +239,6 @@ def fetch_gamma_markets(
 
         # Validar end date e filtrar por max_days
         try:
-            from datetime import datetime, timezone
             end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
             mins_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 60
             if mins_left < -60:   # mercados expirados há mais de 1h
@@ -289,23 +284,90 @@ def fetch_gamma_markets(
         ))
         counts["accepted"] += 1
 
+    return result
+
+
+def fetch_gamma_markets(
+    limit: int = 300,
+    min_liquidity: float = 10.0,
+    max_days: float = 90.0,
+    _debug: bool = True,
+) -> list[PolyMarket]:
+    """
+    Busca mercados cripto ativos com janelas temporais escalonadas.
+    Usa múltiplas queries com ranges menores para não perder mercados
+    devido ao limite de 500 por request da API.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    counts = {
+        "total_raw":     0,
+        "no_symbol":     0,
+        "no_token_ids":  0,
+        "no_end_date":   0,
+        "expired":       0,
+        "too_far":       0,
+        "low_liquidity": 0,
+        "accepted":      0,
+    }
+
+    all_items: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    # Janelas escalonadas para não estourar o limite de 500 por query
+    windows = [
+        (now, now + timedelta(minutes=30)),    # Próximos 30min (urgente)
+        (now + timedelta(minutes=30), now + timedelta(hours=2)),   # 30min-2h
+        (now + timedelta(hours=2), now + timedelta(days=max_days)), # 2h-7d (upcoming)
+    ]
+
+    for i, (dt_min, dt_max) in enumerate(windows):
+        try:
+            r = requests.get(
+                GAMMA_URL,
+                params={
+                    "active": "true", "closed": "false",
+                    "limit": 500,
+                    "end_date_min": dt_min.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end_date_max": dt_max.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "order": "endDate", "ascending": "true",
+                },
+                timeout=15,
+            )
+            r.raise_for_status()
+            raw   = r.json()
+            items = raw if isinstance(raw, list) else raw.get("data", [])
+            all_items.extend(items)
+            if _debug:
+                label = ["0-30min", "30min-2h", f"2h-{max_days}d"][i]
+                print(f"[Gamma] Window {label}: {len(items)} itens")
+        except Exception as e:
+            print(f"[Gamma] Window {i} error: {e}")
+
+    if not all_items:
+        print("[Gamma] Nenhum item retornado da API")
+        return []
+
+    counts["total_raw"] = len(all_items)
+    seen_tokens: set[str] = set()
+    result = _process_raw_items(all_items, min_liquidity, max_days, counts, seen_tokens)
+
     if _debug:
         total = counts["total_raw"]
         print(
-            f"[Gamma] {total} raw → "
+            f"[Gamma] {total} raw -> "
             f"{counts['no_symbol']} no_sym · "
             f"{counts['no_token_ids']} no_tids · "
             f"{counts['no_end_date']} no_date · "
             f"{counts['expired']} expired · "
             f"{counts['too_far']} too_far · "
-            f"{counts['low_liquidity']} low_liq → "
+            f"{counts['low_liquidity']} low_liq -> "
             f"{counts['accepted']} accepted"
         )
 
-    # Se zero aceitados, loga amostra para diagnóstico
-    if counts["accepted"] == 0 and items:
+    if counts["accepted"] == 0 and all_items:
         print("[Gamma] DEBUG — primeiros 3 itens da API:")
-        for i, m in enumerate(items[:3]):
+        for i, m in enumerate(all_items[:3]):
             print(f"  [{i}] question={m.get('question','')[:60]}")
             print(f"       liquidityNum={m.get('liquidityNum')} liquidity={m.get('liquidity')}")
             print(f"       endDateIso={m.get('endDateIso')} endDate={m.get('endDate')}")
@@ -316,12 +378,17 @@ def fetch_gamma_markets(
 
 
 def fetch_short_term_markets(min_liquidity: float = 10.0) -> list[PolyMarket]:
-    """Busca APENAS mercados de curto prazo (3–120 min)."""
-    # max_days=7 em vez de 1 para não perder mercados que vencem nos próximos dias
-    # mas cujo endDate está dentro do range short-term
+    """Busca APENAS mercados de curto prazo (3-120 min)."""
     all_markets  = fetch_gamma_markets(limit=500, min_liquidity=min_liquidity, max_days=7)
     short        = [m for m in all_markets if m.is_short_term()]
-    print(f"[Gamma] Short-term ({SHORT_TERM_MIN_MINUTES}-{SHORT_TERM_MAX_MINUTES}min): {len(short)} mercados")
+    upcoming     = [m for m in all_markets if m.is_upcoming()]
+    print(f"[Gamma] Short-term ({SHORT_TERM_MIN_MINUTES}-{SHORT_TERM_MAX_MINUTES}min): "
+          f"{len(short)} ativos | {len(upcoming)} upcoming (próximas 24h)")
+    if not short and upcoming:
+        # Mostra quando os próximos mercados vão ficar ativos
+        soonest = min(upcoming, key=lambda m: m.mins_left())
+        print(f"[Gamma] Próximo mercado ativo em ~{int(soonest.mins_left())}min: "
+              f"{soonest.question[:60]}")
     return short
 
 
@@ -710,7 +777,7 @@ class MockClobFeed:
     calcula um preço justo baseado no preço spot do Binance vs o strike implícito
     do mercado, depois aplica ruído de mercado em cima.
 
-    Resultado: preços variam entre 0.10–0.90 dependendo do contexto,
+    Resultado: preços variam entre 0.10-0.90 dependendo do contexto,
     gerando edges reais (≥ 0.09) com frequência suficiente para trades.
     """
 
@@ -781,7 +848,7 @@ class MockClobFeed:
 
     @staticmethod
     def _extract_strike(question: str, symbol: str, spot: float) -> float | None:
-        """Extrai o strike price da pergunta. Ex: 'BTC above $85,000' → 85000.0"""
+        """Extrai o strike price da pergunta. Ex: 'BTC above $85,000' -> 85000.0"""
         import re
         q = question.lower()
 

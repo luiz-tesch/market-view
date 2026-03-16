@@ -290,14 +290,16 @@ class TestComputeSignal:
         assert sig.confidence == "low"
 
     def test_high_ticks_can_produce_higher_confidence(self):
-        """Buffer with >300 ticks and >20 candles can yield medium/high confidence."""
+        """Buffer with >300 ticks and >20 candles can yield medium/high confidence.
+        Uses market_price_yes=0.40 to avoid near-50% fee filter (>2.5% fee).
+        """
         buf = _make_trending_buffer(83000, 0.0002, 400)
         # Force candles by injecting synthetic ones
         for _ in range(25):
             buf.candles_1m.append(
                 Candle(ts=time.time(), open=83000, high=83500, low=82500, close=83200, volume=10)
             )
-        sig = compute_signal("BTC", buf, 0.5)
+        sig = compute_signal("BTC", buf, 0.40)
         assert sig.confidence in ("medium", "high")
 
     def test_signal_has_reasons_list(self):

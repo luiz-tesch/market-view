@@ -7,10 +7,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Credenciais ---
-POLYGON_PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY")
-POLYGON_ADDRESS     = os.getenv("POLYGON_ADDRESS")
-GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
-NEWS_API_KEY        = os.getenv("NEWS_API_KEY", "")
+POLYGON_PRIVATE_KEY  = os.getenv("POLYGON_PRIVATE_KEY")
+POLYGON_ADDRESS      = os.getenv("POLYGON_ADDRESS")
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY", "")
+NEWS_API_KEY         = os.getenv("NEWS_API_KEY", "")
 
 # --- Parâmetros de risco ---
 MAX_BET_USDC   = float(os.getenv("MAX_BET_USDC",   "10"))

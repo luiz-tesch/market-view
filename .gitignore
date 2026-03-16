@@ -1,10 +1,32 @@
+# Environment
 .env
+.env.*
 venv/
+
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
 # Data / databases
 data/
+!data/.gitkeep
 *.db
 *.sqlite
 *.sqlite3
-data/*
-!data/.gitkeep
+
+# Logs
+logs/
+
+# Node
+node_modules/
+package.json
+package-lock.json
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/

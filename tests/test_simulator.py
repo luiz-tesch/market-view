@@ -49,7 +49,8 @@ def _make_sim(warm=True) -> tuple[TradingSimulator, dict]:
 def _dummy_yes_signal(edge: float = 0.15, conf: str = "high") -> Signal:
     return Signal(
         symbol="BTC", direction="YES", strength=0.7, confidence=conf,
-        edge=edge, reasons=["test"], momentum_1m=0.3, momentum_5m=0.5,
+        edge=edge, fee_adjusted_edge=edge - 0.01, reasons=["test"],
+        momentum_1m=0.3, momentum_5m=0.5,
         rsi=45, vwap_dev=-0.1, bb_position=0.3, market_type="price",
     )
 
@@ -57,7 +58,8 @@ def _dummy_yes_signal(edge: float = 0.15, conf: str = "high") -> Signal:
 def _dummy_no_signal(edge: float = -0.15, conf: str = "medium") -> Signal:
     return Signal(
         symbol="BTC", direction="NO", strength=0.6, confidence=conf,
-        edge=edge, reasons=["test"], momentum_1m=-0.3, momentum_5m=-0.5,
+        edge=edge, fee_adjusted_edge=abs(edge) - 0.01, reasons=["test"],
+        momentum_1m=-0.3, momentum_5m=-0.5,
         rsi=68, vwap_dev=0.2, bb_position=0.8, market_type="price",
     )
 
