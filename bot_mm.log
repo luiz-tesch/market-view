@@ -6525,3 +6525,386 @@ Arguments: ('954889294846', 10.0, 'Yes', 0.045, 0.5, 0.001, '', -0.4399999999999
 12:30:26 [WARNING] mm.engine — cancel_all() OK — 2 ordens
 12:30:26 [WARNING] bot_mm — 2 ordens canceladas
 12:30:26 [INFO] bot_mm — Encerrado.
+18:29:30 [INFO] bot_mm — Lock de instancia adquirido (PID=4996, porta=54321)
+18:29:31 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/auth/derive-api-key "HTTP/2 200 OK"
+18:29:31 [INFO] bot_mm — CLOB autenticado
+18:29:31 [INFO] bot_mm — Recuperando estado de trades anteriores...
+18:29:31 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/cancel-all "HTTP/2 200 OK"
+18:29:31 [INFO] bot_mm — Ordens da sessão anterior canceladas — slate limpo
+18:29:31 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:29:32 [INFO] bot_mm —   Posição recuperada ...954889294846: 10.00 shares [Yes] @ $0.045
+18:29:32 [INFO] bot_mm —   Posição recuperada ...032909581015: 1.64 shares [Yes] @ $0.834
+18:29:32 [INFO] bot_mm —   Posição recuperada ...322446625434: 1.58 shares [Up] @ $0.630
+18:29:32 [INFO] bot_mm — Estado recuperado: 3 posições | USDC real=$8.5058 | capital_spent=$0.00
+18:29:32 [INFO] bot_mm — ==================================================
+18:29:32 [INFO] bot_mm — ANALISE DAS POSICOES ABERTAS (3)
+18:29:32 [INFO] bot_mm — ==================================================
+18:29:33 [INFO] bot_mm —   ...954889294846 | 10.00 sh [Yes] | compra=0.045 mid=0.500 bid=0.001 | P&L nao-realiz $-0.440 (-97.8%) | tempo=18870min | XX MANTER/DESCARREGAR  (perda - revisar se mercado mudou)
+18:29:34 [WARNING] bot_mm —   ...032909581015: orderbook vazio — mercado fechado?
+18:29:34 [WARNING] bot_mm —   ...322446625434: orderbook vazio — mercado fechado?
+18:29:34 [INFO] bot_mm — ==================================================
+18:29:34 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:29:34 [INFO] bot_mm — Allowance USDC (COLLATERAL) atualizada OK
+18:29:35 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846&signature_type=0 "HTTP/2 200 OK"
+18:29:35 [INFO] bot_mm — Allowance CONDITIONAL OK ...954889294846 (10.00 shares)
+18:29:35 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=90844743874769941462606095963570163953622317354374593191344326387032909581015&signature_type=0 "HTTP/2 200 OK"
+18:29:35 [INFO] bot_mm — Allowance CONDITIONAL OK ...032909581015 (1.64 shares)
+18:29:35 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=59166732149894256224164169669262504822693520748364420970357766872322446625434&signature_type=0 "HTTP/2 200 OK"
+18:29:35 [INFO] bot_mm — Allowance CONDITIONAL OK ...322446625434 (1.58 shares)
+18:29:35 [INFO] bot_mm — Dashboard: http://localhost:5003
+18:29:35 [INFO] bot_mm — 
+==================================================
+  MARKET MAKER — REAL
+  Capital $8 | Ordem $2/side | Dashboard :5003
+==================================================
+18:29:35 [INFO] bot_mm — Buscando mercados...
+18:29:35 [INFO] bot_mm — Dashboard ativo em http://localhost:5003
+18:29:35 [INFO] waitress — Serving on http://127.0.0.1:5003
+18:29:38 [INFO] bot_mm — 10 mercados viáveis
+18:29:39 [INFO] httpx — HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+18:29:39 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [XRP] 9981525089 | mid=0.510 bid=0.495 ask=0.525 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [SOL] 9254976355 | mid=0.500 bid=0.485 ask=0.515 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [BTC] 5619004200 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [BTC] 1146648233 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [BTC] 1813440975 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [BTC] 8852031449 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [BTC] 1101576051 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — [BTC] 4562414449 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:29:39 [INFO] mm.engine — Ordem ignorada (min shares) — size 4.0 < 5
+18:29:39 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:29:40 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:29:40 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:29:41 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:29:41 [INFO] bot_mm — STATUS | ordens=0 | mercados=10 | capital=$0.00 | pnl=$+0.0000
+18:29:51 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [XRP] 9981525089 | mid=0.510 bid=0.495 ask=0.525 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [SOL] 9254976355 | mid=0.500 bid=0.485 ask=0.515 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [BTC] 5619004200 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [BTC] 1146648233 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [BTC] 1813440975 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [BTC] 8852031449 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [BTC] 1101576051 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — [BTC] 4562414449 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:29:51 [INFO] mm.engine — Ordem ignorada (min shares) — size 4.0 < 5
+18:29:51 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:29:52 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:29:52 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:30:06 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:30:07 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [XRP] 9981525089 | mid=0.510 bid=0.495 ask=0.525 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [SOL] 9254976355 | mid=0.500 bid=0.485 ask=0.515 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [BTC] 5619004200 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [BTC] 1146648233 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [BTC] 1813440975 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [BTC] 8852031449 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [BTC] 1101576051 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — [BTC] 4562414449 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:07 [INFO] mm.engine — Ordem ignorada (min shares) — size 4.0 < 5
+18:30:07 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:30:08 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:30:09 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:30:23 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:23 [INFO] httpx — HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+18:30:23 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [XRP] 9981525089 | mid=0.520 bid=0.505 ask=0.535 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [SOL] 9254976355 | mid=0.500 bid=0.485 ask=0.515 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [BTC] 5619004200 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [BTC] 1146648233 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [BTC] 1813440975 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [BTC] 8852031449 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [BTC] 1101576051 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:23 [INFO] mm.engine — [BTC] 4562414449 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:24 [INFO] mm.engine — Ordem ignorada (min shares) — size 4.0 < 5
+18:30:24 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:30:25 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:30:25 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:30:37 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:30:39 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [XRP] 9981525089 | mid=0.520 bid=0.505 ask=0.535 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [SOL] 9254976355 | mid=0.500 bid=0.485 ask=0.515 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [BTC] 5619004200 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [BTC] 1146648233 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [BTC] 1813440975 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [BTC] 8852031449 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [BTC] 1101576051 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — [BTC] 4562414449 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:39 [INFO] mm.engine — Ordem ignorada (min shares) — size 4.0 < 5
+18:30:39 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:30:40 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:30:40 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:30:54 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:54 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:30:55 [INFO] httpx — HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+18:30:55 [INFO] mm.engine — [XRP] 9981525089 | mid=0.520 bid=0.505 ask=0.535 spr=0.0300 [defensive]
+18:30:55 [INFO] mm.engine — [SOL] 9254976355 | mid=0.500 bid=0.485 ask=0.515 spr=0.0300 [defensive]
+18:30:55 [INFO] mm.engine — [BTC] 5619004200 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:55 [INFO] mm.engine — [BTC] 1146648233 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:55 [INFO] mm.engine — [BTC] 1813440975 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:55 [INFO] mm.engine — [BTC] 8852031449 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:55 [INFO] mm.engine — [BTC] 1101576051 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:30:55 [INFO] mm.engine — [BTC] 4562414449 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:30:56 [INFO] mm.engine — Ordem ignorada (min shares) — size 4.0 < 5
+18:30:56 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:30:56 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:30:57 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:31:07 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:31:10 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [XRP] 9981525089 | mid=0.520 bid=0.505 ask=0.535 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [SOL] 9254976355 | mid=0.500 bid=0.485 ask=0.515 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [BTC] 5619004200 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [BTC] 1146648233 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [BTC] 1813440975 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [BTC] 8852031449 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [BTC] 1101576051 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:31:10 [INFO] mm.engine — [BTC] 4562414449 | mid=0.495 bid=0.480 ask=0.510 spr=0.0300 [defensive]
+18:31:11 [INFO] mm.engine — Ordem ignorada (min shares) — size 4.0 < 5
+18:31:11 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:31:11 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:31:12 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:31:19 [WARNING] bot_mm — ==================================================
+18:31:19 [WARNING] bot_mm — SHUTDOWN — cancelando ordens...
+18:31:19 [WARNING] mm.engine — CANCEL ALL — graceful shutdown
+18:31:19 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/cancel-all "HTTP/2 200 OK"
+18:31:19 [WARNING] mm.engine — cancel_all() OK — 0 ordens
+18:31:19 [WARNING] bot_mm — 0 ordens canceladas
+18:31:19 [INFO] bot_mm — Encerrado.
+18:31:56 [INFO] bot_mm — Lock de instancia adquirido (PID=26016, porta=54321)
+18:31:57 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/auth/derive-api-key "HTTP/2 200 OK"
+18:31:57 [INFO] bot_mm — CLOB autenticado
+18:31:57 [INFO] bot_mm — Recuperando estado de trades anteriores...
+18:31:58 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/cancel-all "HTTP/2 200 OK"
+18:31:58 [INFO] bot_mm — Ordens da sessão anterior canceladas — slate limpo
+18:31:58 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:31:59 [INFO] bot_mm —   Posição recuperada ...954889294846: 10.00 shares [Yes] @ $0.045
+18:31:59 [INFO] bot_mm —   Posição recuperada ...032909581015: 1.64 shares [Yes] @ $0.834
+18:31:59 [INFO] bot_mm —   Posição recuperada ...322446625434: 1.58 shares [Up] @ $0.630
+18:31:59 [INFO] bot_mm — Estado recuperado: 3 posições | USDC real=$8.5058 | capital_spent=$0.00
+18:31:59 [INFO] bot_mm — ==================================================
+18:31:59 [INFO] bot_mm — ANALISE DAS POSICOES ABERTAS (3)
+18:31:59 [INFO] bot_mm — ==================================================
+18:32:00 [INFO] bot_mm —   ...954889294846 | 10.00 sh [Yes] | compra=0.045 mid=0.500 bid=0.001 | P&L nao-realiz $-0.440 (-97.8%) | tempo=18868min | XX MANTER/DESCARREGAR  (perda - revisar se mercado mudou)
+18:32:00 [WARNING] bot_mm —   ...032909581015: orderbook vazio — mercado fechado?
+18:32:01 [WARNING] bot_mm —   ...322446625434: orderbook vazio — mercado fechado?
+18:32:01 [INFO] bot_mm — ==================================================
+18:32:01 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:32:01 [INFO] bot_mm — Allowance USDC (COLLATERAL) atualizada OK
+18:32:02 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846&signature_type=0 "HTTP/2 200 OK"
+18:32:02 [INFO] bot_mm — Allowance CONDITIONAL OK ...954889294846 (10.00 shares)
+18:32:02 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=90844743874769941462606095963570163953622317354374593191344326387032909581015&signature_type=0 "HTTP/2 200 OK"
+18:32:02 [INFO] bot_mm — Allowance CONDITIONAL OK ...032909581015 (1.64 shares)
+18:32:02 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=59166732149894256224164169669262504822693520748364420970357766872322446625434&signature_type=0 "HTTP/2 200 OK"
+18:32:02 [INFO] bot_mm — Allowance CONDITIONAL OK ...322446625434 (1.58 shares)
+18:32:02 [INFO] bot_mm — Dashboard: http://localhost:5003
+18:32:02 [INFO] bot_mm — 
+==================================================
+  MARKET MAKER — REAL
+  Capital $8 | Ordem $3/side | Dashboard :5003
+==================================================
+18:32:02 [INFO] bot_mm — Buscando mercados...
+18:32:02 [INFO] bot_mm — Dashboard ativo em http://localhost:5003
+18:32:02 [INFO] waitress — Serving on http://127.0.0.1:5003
+18:32:05 [INFO] bot_mm — 10 mercados viáveis
+18:32:06 [INFO] httpx — HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+18:32:06 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/tick-size?token_id=12386093613394149717990350817258646910469651206641230201416887270206159753008 "HTTP/2 200 OK"
+18:32:06 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/neg-risk?token_id=12386093613394149717990350817258646910469651206641230201416887270206159753008 "HTTP/2 200 OK"
+18:32:07 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/fee-rate?token_id=12386093613394149717990350817258646910469651206641230201416887270206159753008 "HTTP/2 200 OK"
+18:32:07 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:32:07 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:32:07 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:32:07 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/tick-size?token_id=36945662499994256217489067554876541091238205868449884272808338111965077744628 "HTTP/2 200 OK"
+18:32:07 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/neg-risk?token_id=36945662499994256217489067554876541091238205868449884272808338111965077744628 "HTTP/2 200 OK"
+18:32:07 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/fee-rate?token_id=36945662499994256217489067554876541091238205868449884272808338111965077744628 "HTTP/2 200 OK"
+18:32:08 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:32:08 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:32:08 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:32:08 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/tick-size?token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846 "HTTP/2 200 OK"
+18:32:09 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/neg-risk?token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846 "HTTP/2 200 OK"
+18:32:09 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/fee-rate?token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846 "HTTP/2 200 OK"
+18:32:09 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:32:09 [INFO] bot_mm — QUOTE Yes bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:32:09 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:32:10 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:32:10 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:32:10 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:32:11 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:32:11 [INFO] bot_mm — STATUS | ordens=3 | mercados=10 | capital=$0.00 | pnl=$+0.0000
+18:32:18 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:32:19 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:32:19 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:32:33 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:32:34 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:32:35 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:32:35 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:32:49 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:32:49 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:32:49 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:32:49 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:32:50 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:32:50 [INFO] httpx — HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+18:32:51 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:32:51 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:32:51 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:32:51 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:32:52 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:32:52 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:33:03 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:33:05 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:33:06 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:33:06 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:33:20 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:21 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:21 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:33:21 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:33:21 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:21 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:21 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:33:21 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:33:22 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:33:22 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:33:23 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:33:33 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:33:36 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:33:37 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:33:37 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:33:52 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:52 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:52 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:33:52 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:33:52 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:53 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:33:53 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:33:53 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:33:53 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:33:54 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:33:54 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:34:03 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:34:08 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:34:08 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:34:09 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:34:23 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:23 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:23 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:34:23 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:34:23 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:24 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:24 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:34:24 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:34:24 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:34:25 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:34:25 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:34:33 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:34:39 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:34:40 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:34:40 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:34:54 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:55 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:55 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:34:55 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:34:55 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:55 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:34:55 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:34:55 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:35:13 [INFO] bot_mm — Lock de instancia adquirido (PID=20708, porta=54321)
+18:35:14 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/auth/derive-api-key "HTTP/2 200 OK"
+18:35:14 [INFO] bot_mm — CLOB autenticado
+18:35:14 [INFO] bot_mm — Recuperando estado de trades anteriores...
+18:35:14 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/cancel-all "HTTP/2 200 OK"
+18:35:14 [INFO] bot_mm — Ordens da sessão anterior canceladas — slate limpo
+18:35:14 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:35:15 [INFO] bot_mm —   Posição recuperada ...954889294846: 10.00 shares [Yes] @ $0.045
+18:35:15 [INFO] bot_mm —   Posição recuperada ...032909581015: 1.64 shares [Yes] @ $0.834
+18:35:15 [INFO] bot_mm —   Posição recuperada ...322446625434: 1.58 shares [Up] @ $0.630
+18:35:15 [INFO] bot_mm — Estado recuperado: 3 posições | USDC real=$8.5058 | capital_spent=$0.00
+18:35:15 [INFO] bot_mm — ==================================================
+18:35:15 [INFO] bot_mm — ANALISE DAS POSICOES ABERTAS (3)
+18:35:15 [INFO] bot_mm — ==================================================
+18:35:16 [INFO] bot_mm —   ...954889294846 | 10.00 sh [Yes] | compra=0.045 mid=0.500 bid=0.001 | P&L nao-realiz $-0.440 (-97.8%) | tempo=18865min | XX MANTER/DESCARREGAR  (perda - revisar se mercado mudou)
+18:35:17 [WARNING] bot_mm —   ...032909581015: orderbook vazio — mercado fechado?
+18:35:17 [WARNING] bot_mm —   ...322446625434: orderbook vazio — mercado fechado?
+18:35:17 [INFO] bot_mm — ==================================================
+18:35:17 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:35:17 [INFO] bot_mm — Allowance USDC (COLLATERAL) atualizada OK
+18:35:18 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846&signature_type=0 "HTTP/2 200 OK"
+18:35:18 [INFO] bot_mm — Allowance CONDITIONAL OK ...954889294846 (10.00 shares)
+18:35:18 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=90844743874769941462606095963570163953622317354374593191344326387032909581015&signature_type=0 "HTTP/2 200 OK"
+18:35:18 [INFO] bot_mm — Allowance CONDITIONAL OK ...032909581015 (1.64 shares)
+18:35:18 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance/update?asset_type=CONDITIONAL&token_id=59166732149894256224164169669262504822693520748364420970357766872322446625434&signature_type=0 "HTTP/2 200 OK"
+18:35:18 [INFO] bot_mm — Allowance CONDITIONAL OK ...322446625434 (1.58 shares)
+18:35:18 [INFO] bot_mm — Dashboard: http://localhost:5003
+18:35:18 [INFO] bot_mm — 
+==================================================
+  MARKET MAKER — REAL
+  Capital $8 | Ordem $3/side | Dashboard :5003
+==================================================
+18:35:18 [INFO] bot_mm — Buscando mercados...
+18:35:18 [INFO] bot_mm — Dashboard ativo em http://localhost:5003
+18:35:18 [INFO] waitress — Serving on http://127.0.0.1:5003
+18:35:21 [INFO] bot_mm — 10 mercados viáveis
+18:35:22 [INFO] httpx — HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+18:35:22 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/tick-size?token_id=12386093613394149717990350817258646910469651206641230201416887270206159753008 "HTTP/2 200 OK"
+18:35:22 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/neg-risk?token_id=12386093613394149717990350817258646910469651206641230201416887270206159753008 "HTTP/2 200 OK"
+18:35:22 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/fee-rate?token_id=12386093613394149717990350817258646910469651206641230201416887270206159753008 "HTTP/2 200 OK"
+18:35:22 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:35:22 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:35:22 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:35:23 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/tick-size?token_id=36945662499994256217489067554876541091238205868449884272808338111965077744628 "HTTP/2 200 OK"
+18:35:23 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/neg-risk?token_id=36945662499994256217489067554876541091238205868449884272808338111965077744628 "HTTP/2 200 OK"
+18:35:23 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/fee-rate?token_id=36945662499994256217489067554876541091238205868449884272808338111965077744628 "HTTP/2 200 OK"
+18:35:23 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:35:23 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:35:23 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:35:24 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/tick-size?token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846 "HTTP/2 200 OK"
+18:35:24 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/neg-risk?token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846 "HTTP/2 200 OK"
+18:35:24 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/fee-rate?token_id=67565972075898091709163371829761231762318232475740950317083391526954889294846 "HTTP/2 200 OK"
+18:35:24 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:35:24 [INFO] bot_mm — QUOTE Yes bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:35:24 [INFO] mm.engine — [Yes] 6756597207 | mid=0.500 bid=0.468 ask=0.498 spr=0.0300 [defensive]
+18:35:25 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:35:25 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:35:26 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:35:26 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:35:26 [INFO] bot_mm — STATUS | ordens=3 | mercados=10 | capital=$0.00 | pnl=$+0.0000
+18:35:35 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:35:35 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:35:35 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:35:49 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:35:50 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:35:51 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:35:51 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:36:06 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:06 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:06 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:36:06 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:36:06 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:07 [INFO] httpx — HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+18:36:08 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:08 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:36:08 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:36:08 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:36:09 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:36:09 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:36:19 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:36:22 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:36:22 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:36:23 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:36:37 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:37 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:37 [INFO] bot_mm — QUOTE BTC bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:36:37 [INFO] mm.engine — [BTC] 1238609361 | mid=0.505 bid=0.490 ask=0.520 spr=0.0300 [defensive]
+18:36:38 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:36:38 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:36:39 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"
+18:36:50 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=0 "HTTP/2 200 OK"
+18:36:52 [INFO] httpx — HTTP Request: DELETE https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:53 [INFO] httpx — HTTP Request: POST https://clob.polymarket.com/order "HTTP/2 200 OK"
+18:36:53 [INFO] bot_mm — QUOTE ETH bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:36:53 [INFO] mm.engine — [ETH] 3694566249 | mid=0.490 bid=0.475 ask=0.505 spr=0.0300 [defensive]
+18:36:53 [WARNING] bot_mm — Sem orderbook para inventário ...032909581015 — mercado fechado?
+18:36:54 [WARNING] bot_mm — Sem orderbook para inventário ...322446625434 — mercado fechado?
+18:36:54 [INFO] httpx — HTTP Request: GET https://clob.polymarket.com/data/orders?next_cursor=MA== "HTTP/2 200 OK"

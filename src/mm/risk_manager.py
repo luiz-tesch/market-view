@@ -77,6 +77,9 @@ class RiskConfig:
     order_usdc:            float = 5.0
     min_spread:            float = 0.012
     inventory_skew_factor: float = 0.025
+    # Stop-loss: para de comprar e força venda se perda não-realizada > stop_loss_pct
+    stop_loss_pct:         float = 0.60   # 60% de perda no custo da posição líquida
+    stop_loss_min_cost:    float = 0.50   # só ativa com custo mínimo de $0.50
 
 
 class RiskManager:
@@ -232,6 +235,34 @@ class RiskManager:
     # ─────────────────────────────────────────────────────────────────────────
     # Guards
     # ─────────────────────────────────────────────────────────────────────────
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Stop-loss
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def unrealized_loss_pct(self, token_id: str, current_price: float) -> float:
+        """
+        Retorna a fração de perda não-realizada sobre o custo da posição líquida.
+        0.0 = sem perda ou sem posição relevante.
+        1.0 = perda total (posição vale zero).
+        """
+        with self._lock:
+            pos = self._positions.get(token_id)
+            if not pos:
+                return 0.0
+            net = pos.yes_shares
+            if net < 0.1:
+                return 0.0
+            cost = net * pos.avg_buy_price
+            if cost < self.config.stop_loss_min_cost:
+                return 0.0
+        current_value = net * current_price
+        loss = cost - current_value
+        return max(0.0, loss / cost)
+
+    def is_stop_loss_triggered(self, token_id: str, current_price: float) -> bool:
+        """True se a perda não-realizada excede stop_loss_pct e deve parar de comprar."""
+        return self.unrealized_loss_pct(token_id, current_price) >= self.config.stop_loss_pct
 
     def can_quote(self, token_id: str) -> tuple[bool, str]:
         """Retorna (pode_colocar_buy, pode_colocar_sell)."""

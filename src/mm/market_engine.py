@@ -415,13 +415,25 @@ class MarketEngine:
         bid_size  = self.risk.order_size(bid_price, token_id, "buy")
         ask_size  = self.risk.order_size(ask_price, token_id, "sell")
 
+        # Stop-loss: se perda não-realizada excede o limite, força liquidação —
+        # bloqueia novos BUYs e vende ao bid atual (mais agressivo que o ask normal).
+        stop_loss = self.risk.is_stop_loss_triggered(token_id, mid)
+        if stop_loss:
+            loss_pct = self.risk.unrealized_loss_pct(token_id, mid)
+            logger.warning(
+                "STOP-LOSS %s — perda=%.0f%% — bloqueando BUY, SELL agressivo ao bid=%.3f",
+                symbol, loss_pct * 100, snap.bid if snap else bid_price,
+            )
+            bid_size = 0  # sem novos BUYs
+
         placed = []
-        if bid_size > 0 and self.risk.can_buy(token_id):
+        if not stop_loss and bid_size > 0 and self.risk.can_buy(token_id):
             oid = self._place_order(token_id, "buy",  bid_price, bid_size)
             if oid:
                 placed.append(oid)
         if ask_size > 0:
-            oid = self._place_order(token_id, "sell", ask_price, ask_size)
+            sell_price = (round(snap.bid, 3) if snap else bid_price) if stop_loss else ask_price
+            oid = self._place_order(token_id, "sell", sell_price, ask_size)
             if oid:
                 placed.append(oid)
 
