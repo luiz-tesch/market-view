@@ -864,7 +864,7 @@ canvas.spark { width: 100%; height: 28px; display: block; }
         <span class="eq-title">Equity Curve</span>
         <span class="eq-sub" id="eq-sub"></span>
       </div>
-      <canvas id="eq" height="60"></canvas>
+      <canvas id="eq" height="140"></canvas>
     </div>
 
     <div class="pos-head">
@@ -890,7 +890,7 @@ canvas.spark { width: 100%; height: 28px; display: block; }
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────
-let snap = {}, eq = [{ts: Date.now()/1e3, v: 100}];
+let snap = {}, eq = [{ts: Date.now()/1e3, v: 100}], eqTrades = [];
 let ph = {}, prevPx = {}, maxVol = 1, activeTab = 'short';
 const SYMS = ['BTC','ETH','SOL','BNB','MATIC','DOGE','XRP'];
 SYMS.forEach(s => ph[s] = []);
@@ -1020,6 +1020,7 @@ function apply(d) {
   set('pos-cnt', ot.length ? ot.length + ' open' : '');
 
   if (d.equity_curve?.length) eq = d.equity_curve.map(([ts, v]) => ({ ts, v }));
+  eqTrades = (d.closed_trades || []).filter(t => t.exit_ts);
   drawEq();
   set('eq-sub', `$${(st.total_fees || 0).toFixed(3)} fees · ${st.total_trades || 0} trades`);
 
@@ -1338,29 +1339,104 @@ function renderLog(logs) {
 // ── Canvas: equity ─────────────────────────────────────────────────────
 function drawEq() {
   const cv = document.getElementById('eq'); if (!cv || eq.length < 2) return;
-  const w = cv.offsetWidth || 600, h = 60; cv.width = w; cv.height = h;
-  const ctx = cv.getContext('2d'); ctx.clearRect(0, 0, w, h);
+  const H = 140, w = cv.offsetWidth || 600;
+  cv.width = w; cv.height = H;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, w, H);
+
   const vals = eq.map(p => p.v);
-  const mn = Math.min(...vals) * .997, mx = Math.max(...vals) * 1.003, rng = mx - mn || 1;
-  const pts = vals.map((v, i) => [i / (vals.length - 1) * w, h - ((v - mn) / rng * (h - 6) + 3)]);
-  const cur = vals.at(-1), up = cur >= 100;
-  const col = up ? '#00e87a' : '#ff4d6a';
-  const bl = h - ((100 - mn) / rng * (h - 6) + 3);
+  // ensure $100 is always within range so the baseline is always visible
+  const mn = Math.min(...vals, 100) * .997;
+  const mx = Math.max(...vals, 100) * 1.003;
+  const rng = mx - mn || 1;
+  const PAD = 14; // vertical padding (px)
+  function yOf(v) { return H - ((v - mn) / rng * (H - PAD) + PAD / 2); }
+  const pts = vals.map((v, i) => [i / (vals.length - 1) * w, yOf(v)]);
+  const cur = vals.at(-1);
+  const col = cur >= 100 ? '#00e87a' : '#ff4d6a';
+  const bl  = yOf(100);
+
+  // $100 baseline
   ctx.beginPath(); ctx.moveTo(0, bl); ctx.lineTo(w, bl);
-  ctx.strokeStyle = 'rgba(255,255,255,.05)'; ctx.lineWidth = 1;
-  ctx.setLineDash([4, 5]); ctx.stroke(); ctx.setLineDash([]);
-  const gr = ctx.createLinearGradient(0, 0, 0, h);
-  gr.addColorStop(0, up ? 'rgba(0,232,122,.12)' : 'rgba(255,77,106,.12)');
-  gr.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 1;
+  ctx.setLineDash([4, 6]); ctx.stroke(); ctx.setLineDash([]);
+  ctx.font = '500 8px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(255,255,255,.12)';
+  ctx.fillText('$100', 4, bl - 3);
+
+  // green fill: profit zone (above baseline), clipped
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, w, bl); ctx.clip();
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
   pts.slice(1).forEach(([x, y]) => ctx.lineTo(x, y));
-  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
-  ctx.fillStyle = gr; ctx.fill();
-  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  ctx.lineTo(w, bl); ctx.lineTo(0, bl); ctx.closePath();
+  const grG = ctx.createLinearGradient(0, 0, 0, bl);
+  grG.addColorStop(0, 'rgba(0,232,122,.18)');
+  grG.addColorStop(1, 'rgba(0,232,122,.03)');
+  ctx.fillStyle = grG; ctx.fill();
+  ctx.restore();
+
+  // red fill: drawdown zone (below baseline), clipped
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, bl, w, H - bl); ctx.clip();
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  pts.slice(1).forEach(([x, y]) => ctx.lineTo(x, y));
+  ctx.lineTo(w, H); ctx.lineTo(0, H); ctx.closePath();
+  const grR = ctx.createLinearGradient(0, bl, 0, H);
+  grR.addColorStop(0, 'rgba(255,77,106,.10)');
+  grR.addColorStop(1, 'rgba(255,77,106,.22)');
+  ctx.fillStyle = grR; ctx.fill();
+  ctx.restore();
+
+  // curve line
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
   pts.slice(1).forEach(([x, y]) => ctx.lineTo(x, y));
   ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke();
-  ctx.fillStyle = col; ctx.font = '500 10px IBM Plex Mono';
-  ctx.fillText('$' + cur.toFixed(2), w - 62, pts.at(-1)[1] - 5);
+
+  // trade outcome dots
+  if (eqTrades.length && eq.length > 1) {
+    const tsMin = eq[0].ts, tsMax = eq.at(-1).ts;
+    const tsRng = tsMax - tsMin || 1;
+    for (const t of eqTrades) {
+      if (!t.exit_ts) continue;
+      const frac = (t.exit_ts - tsMin) / tsRng;
+      if (frac < 0 || frac > 1.02) continue;
+      const x   = Math.max(4, Math.min(w - 4, frac * w));
+      const idx = Math.min(Math.round(frac * (pts.length - 1)), pts.length - 1);
+      const y   = pts[idx][1];
+      ctx.beginPath();
+      ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = t.won ? '#00e87a' : '#ff4d6a';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(6,8,12,.85)';
+      ctx.lineWidth = 1; ctx.stroke();
+    }
+  }
+
+  // peak / valley labels
+  const maxV = Math.max(...vals), minV = Math.min(...vals);
+  ctx.font = '500 9px IBM Plex Mono';
+  if (maxV > 100.3) {
+    const pi = vals.lastIndexOf(maxV);
+    const px = Math.max(4, Math.min(w - 72, pts[pi][0]));
+    ctx.fillStyle = 'rgba(0,232,122,.75)';
+    ctx.fillText('▲ $' + maxV.toFixed(2), px, Math.max(11, pts[pi][1] - 5));
+  }
+  if (minV < 99.7) {
+    const vi = vals.indexOf(minV);
+    const vx = Math.max(4, Math.min(w - 72, pts[vi][0]));
+    ctx.fillStyle = 'rgba(255,77,106,.75)';
+    ctx.fillText('▼ $' + minV.toFixed(2), vx, Math.min(H - 4, pts[vi][1] + 11));
+  }
+
+  // current value label
+  ctx.fillStyle = col;
+  ctx.font = '600 10px IBM Plex Mono';
+  const lastY = Math.max(12, Math.min(H - 4, pts.at(-1)[1] - 6));
+  ctx.fillText('$' + cur.toFixed(2), w - 64, lastY);
 }
 
 // ── Canvas: sparkline ──────────────────────────────────────────────────
