@@ -692,7 +692,7 @@ canvas.spark { width: 100%; height: 28px; display: block; }
 <!-- TOPBAR -->
 <div class="topbar">
   <span class="dot live" id="status-dot"></span>
-  <span class="brand">ALPHA-GUY</span>
+  <span class="brand">MARKET-VIEW</span>
   <div class="sep"></div>
   <span class="badge badge-amber" id="pill-bin">BIN MOCK</span>
   <span class="badge badge-amber" id="pill-clob">CLOB MOCK</span>
