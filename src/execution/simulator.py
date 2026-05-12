@@ -187,11 +187,12 @@ class SimStats:
 class TradingSimulator:
 
     # ── Parâmetros de risco ────────────────────────────────────────────────────
-    MAX_POSITION_PCT  = 0.05
-    MAX_OPEN_TRADES   = 4
-    STOP_LOSS_PCT     = 0.40
-    TAKE_PROFIT_PCT   = 0.70
-    KELLY_FRACTION    = 0.15
+    MAX_POSITION_PCT      = 0.05
+    MAX_OPEN_TRADES       = 4
+    STOP_LOSS_PCT         = 0.40
+    STOP_LOSS_MIN_AGE_PCT = 0.50   # stop loss só ativa após 50% do horizonte
+    TAKE_PROFIT_PCT       = 0.70
+    KELLY_FRACTION        = 0.15
     MIN_BALANCE       = 5.0
     COOLDOWN_SECONDS  = 300
     ALLOWED_CONF      = {"medium", "high"}
@@ -725,10 +726,12 @@ class TradingSimulator:
                 if len(t.price_history) > 120:
                     t.price_history = t.price_history[-120:]
 
-                age_min  = (now - t.entry_ts) / 60
-                sell_val = bid if t.action == "BUY_YES" else (1.0 - ask_mkt)
+                age_min      = (now - t.entry_ts) / 60
+                sell_val     = bid if t.action == "BUY_YES" else (1.0 - ask_mkt)
+                frac_elapsed = age_min / t.horizon_min if t.horizon_min > 0 else 1.0
 
-                if sell_val < t.entry_price * (1 - self.STOP_LOSS_PCT):
+                if (sell_val < t.entry_price * (1 - self.STOP_LOSS_PCT)
+                        and frac_elapsed >= self.STOP_LOSS_MIN_AGE_PCT):
                     to_close.append((t, "STOP_LOSS", False, sell_val))
                     continue
 
