@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 
 RESOLUTION_WORKER_INTERVAL = 300      # verifica fila a cada 5 minutos
 PENDING_EXPIRY_SECONDS     = 48 * 3600  # 48h sem resultado → EXPIRED
+PENDING_SIM_FALLBACK_SECS  = 20 * 60   # fallback para simulação se oracle silencioso 20min
 
 
 # ── Trade ──────────────────────────────────────────────────────────────────────
@@ -779,7 +780,19 @@ class TradingSimulator:
             self._close(trade, reason, won, exit_val)
 
         elif self._market_past_end_date(trade):
-            self._enter_pending(trade)
+            # Condition IDs sintéticos (demo_*) nunca resolvem via API — simula direto
+            is_real = bool(trade.condition_id) and not trade.condition_id.startswith("demo_")
+            if is_real:
+                self._enter_pending(trade)
+            else:
+                won = self._simulate_resolution(trade)
+                self.stats.simulated_resolutions += 1
+                self._log(
+                    "RESOLVE_SIMULATED",
+                    f"Proxy Binance {trade.symbol} "
+                    f"(real={self.stats.real_resolutions} sim={self.stats.simulated_resolutions})"
+                )
+                self._close(trade, reason, won, exit_val)
 
         else:
             won = won_arg if won_arg is not None else self._simulate_resolution(trade)
@@ -855,13 +868,29 @@ class TradingSimulator:
                     real_outcome = fetch_market_resolution(trade.condition_id)
                 except Exception as e:
                     self._log("RESOLUTION_ERR", f"{trade.symbol}: {e}", level="error")
-                    continue
 
                 if real_outcome is not None:
                     won = real_outcome if trade.action == "BUY_YES" else (not real_outcome)
                     self.stats.real_resolutions += 1
                     trade._resolved_real = True
                     self._close_pending(trade, won, real_outcome)
+                    resolved_ids.append(trade.id)
+                elif waiting_secs >= PENDING_SIM_FALLBACK_SECS:
+                    # Oracle silencioso por 20min — fallback via Binance
+                    won = self._simulate_resolution(trade)
+                    self.stats.simulated_resolutions += 1
+                    mins = round(waiting_secs / 60)
+                    self._log(
+                        "RESOLVE_SIMULATED",
+                        f"⚡ Oracle timeout ({mins}min) {trade.symbol} → simulando via Binance "
+                        f"(real={self.stats.real_resolutions} sim={self.stats.simulated_resolutions})",
+                        level="info",
+                    )
+                    with self._lock:
+                        trade.status             = "OPEN"
+                        trade.pending_resolution = False
+                        self.open_trades.append(trade)
+                    self._close(trade, "RESOLVE_SIMULATED", won, 1.0 if won else 0.0)
                     resolved_ids.append(trade.id)
                 else:
                     mins_waiting = round(waiting_secs / 60, 1)
